@@ -5,7 +5,7 @@
 #' @param dist The distance (in the same units used in  `park`) to buffer around spatial object `park`
 #' 
 #' @return An sf object of points of diversion within given spatial boundary and attributes
-getPODUtah <- function(aoi, save=FALSE, path){
+getPODUtah <- function(aoi, dist = 0){
   
   call <- "https://opendata.arcgis.com/api/v3/datasets/5d530e62e6ca42528dd13e0a453a3b73_0/downloads/data?format=shp&spatialRefId=26912&where=1%3D1"
   #download boundary 
@@ -29,7 +29,7 @@ getPODUtah <- function(aoi, save=FALSE, path){
     sf::st_intersection(., dplyr::select(aoi_buffer, UNIT_CODE)) %>%
     sf::st_join(.,dplyr::select(aoi, within = UNIT_CODE), left = TRUE) %>%
     dplyr::mutate(park_right = ifelse(grepl("National Park", OWNER, ignore.case = T), "Park","Non-park"),
-                  within_park = ifelse(!is.na(within), "Within Park")) %>%
+                  within_park = ifelse(!is.na(within), "Within Park", NA)) %>%
     select(-within)
   
   return(nearby_wr)
