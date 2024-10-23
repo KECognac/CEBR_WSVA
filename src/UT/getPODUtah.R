@@ -13,34 +13,36 @@
 #'      X = Mining
 #' 
 #' @param aoi An sf polygon object, often a park boundary (or boundaries) retrieved from `getParkBoundary()`.
-#' @param dist The distance (in the same units used in  `park`) to buffer around spatial object `park`
+#' @param dist The distance (in the same units used in  `aoi`) to buffer around spatial object `aoi`
 #' 
 #' @return An sf object of points of diversion within given spatial boundary and attributes
 getPODUtah <- function(aoi, dist = 0){
-  
-  call <- "https://opendata.arcgis.com/api/v3/datasets/5d530e62e6ca42528dd13e0a453a3b73_0/downloads/data?format=shp&spatialRefId=26912&where=1%3D1"
-  #download boundary 
-  temp1 <- tempfile()
-  download.file(paste0(call), destfile = temp1, method = "curl")
-  
-  temp2 <- tempfile()
-  unzip(temp1, exdir = temp2)
-  
-  sf::sf_use_s2(FALSE)
   
   # add buffer around park boundary
   aoi_buffer <- aoi %>% 
     sf::st_buffer(dist = dist)
   
-  ut_wr <- sf::st_read(dsn = temp2) %>%
-    sf::st_transform(4269)
+  ## convert park boundary bbox to esri geom object
+  filter_geom <- aoi_buffer %>%
+    sf::st_transform(4326) %>%
+    sf::st_bbox() %>% 
+    sf::st_as_sfc(filter_geom) %>% 
+    .[[1]] %>% 
+    arcgisutils::as_esri_geometry()
+  
+  ## create the rest API
+  url <- paste0("https://services.arcgis.com/ZzrwjTRez6FJiOq4/ArcGIS/rest/services/PODservice/FeatureServer/0/query?returnGeometry=true&where=1=1&outFields=*&f=geojson&geometry=",
+                filter_geom,
+                "&geometryType=esriGeometryPolygon&inSR=4326&spatialRel=esriSpatialRelIntersects")
+  
+  ut_wr <- st_read(url) %>%
+    sf::st_transform(st_crs(aoi))
   
   #join sf object and table attributes and filter to park boundary region of interest
   nearby_wr <- ut_wr %>%    
-    sf::st_intersection(., dplyr::select(aoi_buffer, UNIT_CODE)) %>%
     sf::st_join(.,dplyr::select(aoi, within = UNIT_CODE), left = TRUE) %>%
     dplyr::mutate(park_right = ifelse(grepl("National Park", OWNER, ignore.case = T), "Park","Non-park"),
-                  within_park = ifelse(!is.na(within), "Within Park", NA)) %>%
+                  within_aoi = ifelse(!is.na(within), "Within AOI", NA)) %>%
     dplyr::select(-within)
   
   return(nearby_wr)
