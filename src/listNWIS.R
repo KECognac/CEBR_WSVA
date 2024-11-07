@@ -7,19 +7,15 @@
 #' @return An sf object of USGS gaging stations within given spatial boundary and attributes
 listNWIS <- function(aoi, dist){
   
-  sf::sf_use_s2(FALSE)
-  
   # add buffer around area of interest
   aoi_buffer <- aoi %>% 
     sf::st_buffer(., dist = dist)
-  
-  # aoi <- getParkBoundary("DEVA")
   
   gage_sites <- vector("list", length = nrow(aoi_buffer))
   
   for (i in 1:nrow(aoi_buffer)){
     
-    bbox <- sf::st_bbox(aoi_buffer[i]) %>%
+    bbox <- sf::st_bbox(aoi_buffer[i,]) %>%
       as.vector() %>%
       round(., digits=7) %>% 
       paste(collapse = ",")
@@ -41,7 +37,8 @@ listNWIS <- function(aoi, dist){
   
   inventory <- gage_sites %>%
     dplyr::left_join(pcodes,by="parm_cd") %>%
-    sf::st_intersection(.,aoi_buffer) %>%
+    sf::st_transform(st_crs(aoi_buffer)) %>%
+    .[aoi_buffer,] %>%
     # sf::st_join(., dplyr::select(aoi, UNIT_CODE), left=T) %>%
     # dplyr::mutate(within_park=ifelse(is.na(UNIT_CODE.y), "Outside","Within")) %>%
     dplyr::select(c(site_no,
@@ -53,7 +50,7 @@ listNWIS <- function(aoi, dist){
                     end_date,
                     parameter=parameter_name_description,
                     code=parm_cd))
-    
+  
   site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
   
   table <- rvest::read_html(site_url) %>%
@@ -62,7 +59,7 @@ listNWIS <- function(aoi, dist){
   
   table <- rbind(table[[1]],table[[2]],table[[3]],table[[4]],table[[5]]) %>%
     dplyr::select(site_type_cd = 1,
-           site_type = 2)
+                  site_type = 2)
   
   inventory <- left_join(inventory,table,by='site_type_cd') %>%
     mutate(data_type=case_when(data_type_cd=="dv" ~ "Daily",
@@ -75,9 +72,8 @@ listNWIS <- function(aoi, dist){
                                data_type_cd=="ad" ~ "USGS Annual Water Data Report",
                                data_type_cd=="aw" ~ "Active Groundwater Level Network",
                                data_type_cd=="id" ~ "Historic Instantaneous")) %>%
-    sf::st_join(., dplyr::select(aoi_buffer))#, UNIT_CODE))
+    sf::st_join(., dplyr::select(aoi_buffer))
   
   return(inventory)
   
 }
-
