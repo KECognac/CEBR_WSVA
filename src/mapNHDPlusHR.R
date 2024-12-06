@@ -12,13 +12,22 @@ mapNHDPlusHR <- function(aoi){
     
     # filter out and clip the catchment features within the park boundaries:
     flowlines[[i]] <- sf::st_read(dsn = file, layer = "NHDFlowline") %>%
-      st_zm() %>%
-      .[st_transform(aoi, 4269),]
+      st_zm()
+    
+    if(st_crs(aoi)$epsg != 4269){
+      flowlines[[i]] <- flowlines[[i]] %>%
+        .[st_transform(aoi, 4269),]
+    } else {
+      
+      flowlines[[i]] <- flowlines[[i]] %>%
+        .[aoi,]
+    }
     
   }
   
-  flowlines<- bind_rows(flowlines)
-  
-  return(flowlines)
+  flowlines<- bind_rows(flowlines) %>%
+    
+    
+    return(flowlines)
   
 }
