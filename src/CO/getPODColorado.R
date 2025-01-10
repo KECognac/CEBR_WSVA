@@ -19,14 +19,13 @@ getPODColorado <- function(aoi, dist = 0){
   temp2 <- tempfile()
   unzip(temp1, exdir = temp2)
   
-  sf::sf_use_s2(FALSE)
-  
   # add buffer around park boundary
   aoi_buffer <- aoi %>%
     sf::st_zm() %>%
     sf::st_buffer(dist = dist)
   
   co_wr <- sf::st_read(dsn = temp2) %>%
+    st_make_valid() %>% 
     sf::st_transform(4269)
   
   #join sf object and table attributes and filter to park boundary region of interest

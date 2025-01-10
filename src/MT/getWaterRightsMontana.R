@@ -39,8 +39,7 @@ getWaterRightsMontana <- function(aoi, dist = 0){
   # POD1 <- st_read(list.files(temp2, full.names = TRUE), layer = "WR1DIV")
   # RES1 <- st_read(list.files(temp2, full.names = TRUE), layer = "WR1RES")
   
-  sf::sf_use_s2(FALSE)
-  
+
   aoi <- aoi  %>%
     st_transform(crs(POD))
   
