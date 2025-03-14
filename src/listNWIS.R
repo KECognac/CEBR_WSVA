@@ -46,7 +46,7 @@ listNWIS <- function(aoi, dist, sites = NULL){
     gage_sites <- dplyr::bind_rows(gage_sites) %>%
       sf::st_as_sf(coords = c('dec_long_va', 'dec_lat_va'), crs = 4269)
     
-    if(st_crs(aoi) == st_crs(gage_sites)){
+    if(!st_crs(aoi) == st_crs(gage_sites)){
       
       gage_sites <- st_transform(gage_sites, st_crs(aoi))
       
