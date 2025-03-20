@@ -1,45 +1,46 @@
-add_gw_meta <- function(nwis_groundwater) {
-  #' Adds well and aquifer metadata to nwis_groundwater dataframe based on USGS
-  #' site_no 
-  #' @param nwis_groundwater <- a list of nwis groundwater sites returned
-  #'                            and filtered from function 'listNWIS'
-  #'                            
+#' Adds well and aquifer metadata to nwis_groundwater dataframe based on USGS site_no 
+#' @param nwis_groundwater a list of nwis groundwater sites returned and filtered from function 'listNWIS'
+#'              
 
-  
+add_gw_meta <- function(nwis_groundwater) {
+
 # Define function to get well metadata
-get_well_meta <- function(nwis_groundwater) {
+get_well_meta <- function(gw_list) {
+  
   # First, get well metadata using dataRetrieval function 'readNWISsite'
-  nwis_groundwater_meta <- nwis_groundwater %>%
-    dplyr::left_join(
-      dataRetrieval::readNWISsite(nwis_groundwater$site_no) %>% 
-        dplyr::select(c("site_no",
-                        "state_cd",
-                        "huc_cd", 
-                        "basin_cd", 
-                        "topo_cd", 
-                        "drain_area_va", 
-                        "contrib_drain_area_va",
-                        "nat_aqfr_cd", 
-                        "aqfr_cd", 
-                        "aqfr_type_cd", 
-                        "well_depth_va")),
-      by = "site_no")  
+  nwis_site_dat <- dataRetrieval::readNWISsite(gw_list$site_no) %>% 
+    dplyr::select(c("site_no",
+                    "state_cd",
+                    "huc_cd", 
+                    "basin_cd", 
+                    "topo_cd", 
+                    "drain_area_va", 
+                    "contrib_drain_area_va",
+                    "nat_aqfr_cd", 
+                    "aqfr_cd", 
+                    "aqfr_type_cd", 
+                    "well_depth_va"))
+ 
+  nwis_groundwater_meta <- gw_list %>%
+    dplyr::left_join(., nwis_site_dat, by = "site_no")  
+  
   return(nwis_groundwater_meta)
+  
 }
 
 
 if (nrow(nwis_groundwater) > 35000) {
   
-  # Split the data frame into chunks of desired size (e.g., 35000 rows)
-  chunk_size <- 35000
-  df_list <- split(nwis_groundwater, 
-                   ceiling(seq_len(nrow(nwis_groundwater)) / chunk_size))
+  # Split the data frame into chunks of desired size (here, 35000 rows)
+
+    df_list <- split(nwis_groundwater, 
+                   ceiling(seq_len(nrow(nwis_groundwater)) / 35000))
 
   # Process each chunk and combine results
   nwis_groundwater_meta <- map_dfr(df_list, get_well_meta)
   
 } else {
-  nwis_groundwater_meta <- get_well_meta(nwis_groundwater)
+  nwis_groundwater_meta <- get_well_meta(gw_list = nwis_groundwater)
 }
  
 # Next get aquifer name from USGS database
@@ -57,7 +58,7 @@ aquifer_table <- webpage %>%
   mutate("State Code" = as.character(`State Code`))
 
 nwis_groundwater_meta <- nwis_groundwater_meta %>%
-  dplyr::left_join(aquifer_table, 
+  dplyr::left_join(., aquifer_table, 
              by = c("aqfr_cd" = "Local Aquifer Code", 
                     "state_cd" = "State Code"))
 
@@ -78,7 +79,9 @@ aquifer_type_codes <- data.frame(
 )
 
 nwis_groundwater_meta <- nwis_groundwater_meta %>%
-    dplyr::left_join(aquifer_type_codes, by = c("aqfr_type_cd" = "code"))  
+  dplyr::left_join(aquifer_type_codes, by = c("aqfr_type_cd" = "code")) %>%
+  # should never me empty. 
+  filter(!is.na(huc_cd))
 
 
 
