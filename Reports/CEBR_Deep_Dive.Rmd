@@ -421,8 +421,13 @@ nwis_select_watershed <- nwis_select_stream_gage$site_no %>%
                   set_units("km^2") %>% 
                   as.numeric())
 
+
+#watersheds <- getWatersheds(aoi = st_buffer(park_boundary, 10000))
+
+
 mammoth_creek_watershed <- nldi_finder(site_no = 10173450)
 sevier_watershed <- nldi_finder(site_no = 10174500)
+navajo_lake <- nldi_finder(site_no = 10173800)
 coal_creek_watershed <- nldi_finder(site_no = 10242000)
 north_fork_virgin_watershed <- nldi_finder(site_no = 371705112565001)
 duck_creek_watershed <- data.frame(name = "duck_creek",
@@ -431,6 +436,21 @@ duck_creek_watershed <- data.frame(name = "duck_creek",
   st_as_sf(coords = c("long","lat"), crs = 4326) %>%
   getXYWatersheds()
 
+
+mapview(mammoth_creek_watershed %>% dplyr::mutate(name = "Mammoth Creek"),
+        zcol = NULL,
+        col.regions = pal$lightblue,
+        layer.name = "Mammoth Creek") +
+  #mapview(sevier_watershed) +
+  mapview(coal_creek_watershed %>% dplyr::mutate(name = "Coal Creek"),
+          zcol = NULL,
+          col.regions = pal$orange,
+          layer.name = "Coal Creek") +
+  #mapview(north_fork_virgin_watershed) +
+  mapview(duck_creek_watershed,
+          col.regions = pal$darkblue,
+          layer.name = "Duck Creek") +
+mapview(park_boundary, alpha.regions = 0, lwd = 4, layer.name = "CEBR", col.regions = "black")
 
 # Download data from reference stream sites
 nwis_select_discharge <- 
