@@ -35,7 +35,7 @@ nps_pal <-list(blue = "#85b6dc",
                grey = "#a9a9a9", 
                lightgrey = "#dcdcdc")
 
-#load("data/park/ZION/.........")
+load("data/park/CEBR/CEBR_report_data.RData")
 
 ```
 
@@ -98,8 +98,6 @@ mapview(springs[,-3],
 
 With our water supplies identified, we can now delineate the source areas. We'll bring in surface watersheds and geology layers to do this.
 
-
-
 #### ----- Watersheds
 
 ```{r watersheds}
@@ -111,7 +109,7 @@ source_table_locs <- source_table_locs %>%
                              .f = ~ getXYWatersheds(sf = source_table_locs[.x,], coordinates = NULL, snap = TRUE)))
 
 # Plot
-mapview(source_table_loc$watershed)
+mapview(source_table_locs$watershed)
 ```
 
 #### ----- Geology
@@ -156,8 +154,7 @@ mapview(nps_faults, color = "black") +
   mapview(springs[,1], col.regions = "red")
 
 claron <- c("Tc","Tcp", "Tcw", "Tcwl", "Tcwm", "Tcwml", "Tcwt","Tcwu")
-q_volc <- c("")
-
+q_colluv <- c("Qc", "QTbx", "Qmsc","Qac") # pleistocene to holocene alluvium, colluvium, gravity slide
 
 mapviewOptions(fgb = FALSE, 
                georaster = FALSE, 
@@ -280,6 +277,12 @@ blowhard_mtn <- weather_data_an %>%
   dplyr::filter(name == "BLOWHARD MTN RADAR",
                 year > 1964 & year < 2006) 
 
+blowhard_mtn_d <- weather_data %>%
+  dplyr::mutate(year = year(date)) %>%
+  dplyr::filter(name == "BLOWHARD MTN RADAR")
+#                year > 1964 & year < 2006) 
+
+
 # Print statistics summary for Blowhard Mtn station
 print(blowhard_mtn %>% summary())
 
@@ -303,6 +306,7 @@ p1 <- ggplot(weather_data_mon %>% dplyr::filter(name %in% select_station_list),
   #geom_smooth(method = "lm", se = FALSE) +
   theme_bw() 
 
+
 ggarrange(p1,
           p1 + xlim(as.Date("1965-01-01"), as.Date("1972-01-01")) +
             labs(title = "Overlap Period:"),
@@ -315,6 +319,44 @@ ggplot(blowhard_mtn %>% pivot_longer(cols = c("tmax","tmin","tmean","prcp","snow
   theme_bw() +
   labs(x = "", y = "Annual precipitation (in)") +
   scale_color_manual("", values = c(pal$lightblue, pal$darkblue), labels = c("Total Precipitation","Total Snow"))
+
+```
+
+
+#### ----- SNOTEL
+
+```{r snotel}
+
+snotel <- getSNOTEL(aoi = park_boundary, dist = 3000, years = "all") %>%
+  clean_names()
+
+snotel_sites <- snotel %>%
+  group_by(site) %>%
+  dplyr::slice(1) %>% 
+  ungroup()
+
+mapview(snotel_sites)
+
+snotel_tidy <- snotel %>%
+  st_drop_geometry() %>%
+  dplyr::filter(sensor_id %in% c("PREC.I", "SNWD.I", "WTEQ.I")) %>%
+  dplyr::select(date, name, value, sensor_id, water_year) %>%
+  dplyr::group_by(date, name, sensor_id, water_year) %>%
+  dplyr::summarize(value = mean(value, na.rm = TRUE)) %>%
+  dplyr::ungroup() %>%
+  pivot_wider(names_from = sensor_id, values_from = value) %>% 
+  clean_names()
+
+ggplot(snotel_tidy, aes(x = date, y = wteq_i, color = name)) +
+  geom_point() +
+  geom_line() +
+  # compare to blowhard mtn - assume snow density 0.23 based on brian head magnitude only 
+  geom_point(data = blowhard_mtn_d, aes(x = date, y = .23 * snwd, color = "Blowhard")) +
+  geom_line(data = blowhard_mtn_d, aes(x = date, y = .23 * snwd, color = "Blowhard")) +
+  labs(x = "", y = "SWE (in)") +
+  theme_bw() +
+  scale_color_manual("", values = c("black", "red"))
+
 
 ```
 
@@ -385,7 +427,6 @@ ggplot(pdat_mon, aes(x = month_date)) +
 
 ```
 
-
 #### ----- NWIS Surface Water
 
 For many parks, the nearest USGS stream gage is far away. Therefore, here we pull in all NWIS gages within 100 km of the park boundary. Of those, we only select stream gages that are considered "reference" gages in the [GAGES-II database (Falcone, 2011)](https://pubs.usgs.gov/publication/70046617). We then select the gage that is closest to the park with the most complete period of record and delineate its associated watershed using the `get_nldi_basin()` function from the {nhdplusTools} package.
@@ -421,6 +462,12 @@ nwis_select_watershed <- nwis_select_stream_gage$site_no %>%
                   set_units("km^2") %>% 
                   as.numeric())
 
+# Load NHD flowlines and filter for specific reaches within the watershed. We
+# will use these to select subsets of the alluvium for a volume analysis.
+park_flowlines <- park_boundary %>%
+  st_buffer(4000) %>%
+  dplyr::summarize() %>%
+  mapNHDPlusHR() 
 
 #watersheds <- getWatersheds(aoi = st_buffer(park_boundary, 10000))
 
@@ -546,6 +593,7 @@ spring_elev <- terra::extract(elev, source_table_locs, method = "bilinear")[[2]]
 thresh_elev <- elev
 thresh_elev[thresh_elev <= spring_elev] <- NA
 thresh_bin <- ifel(!is.na(thresh_elev), 1, NA)
+names(thresh_elev) <- "Elevation"
 
 # Extract areas as polygons rather than just the original raster
 thresh_poly <- as.polygons(thresh_bin, dissolve = TRUE, na.rm = TRUE) %>%
@@ -557,8 +605,8 @@ recharge_area <- thresh_poly[9,]
 
 # Plot 
 mapview::mapviewOptions(basemaps = c("Esri.WorldTopoMap"))# "Esri.WorldImagery"))
-mapview(recharge_area, col.regions = "yellow", layer.name = "Recharge Area") +
-  mapview(thresh_poly, col.regions = "dodgerblue", alpha.regions = 0.2, layer.name = "High-Elevation Area")
+mapview(recharge_area, col.regions = "dodgerblue", layer.name = "Recharge Area") #+
+#  mapview(thresh_poly, col.regions = "dodgerblue", alpha.regions = 0.2, layer.name = "High-Elevation Area")
 
 my_colors <- colorRampPalette(c("lightblue","darkblue"))(100)
 
@@ -569,19 +617,20 @@ mapview(thresh_elev,
         na.color = NA) +
   mapview(source_table_locs,
           layer.name = "Blowhard Spring",
-          col.regions = "red") +
-  mapview(duck_creek_watershed,
-          alpha.regions = .1,
-          col.regions = "orange",
-          layer.name = "Duck Creek Watershed") +
-  mapview(mammoth_creek_watershed,
-          layer.name = "Mammoth Creek Watershed",
-          col.regions = "hotpink",
-          alpha.regions = 0.1)
+          col.regions = "red") #+
+#  mapview(duck_creek_watershed,
+#          alpha.regions = .1,
+#          col.regions = "orange",
+#          layer.name = "Duck Creek Watershed") +
+#  mapview(mammoth_creek_watershed,
+#          layer.name = "Mammoth Creek Watershed",
+#          col.regions = "hotpink",
+#          alpha.regions = 0.1)
 
 
 
-b <- a +
+b <- mapview(source_table_locs,
+             layer.name = "Blowhard Spring") +
 mapview(recharge_area, col.regions = "dodgerblue")
 
 b
@@ -772,30 +821,32 @@ geom_abline(intercept = cc_int, slope = cc_slope, show.legend = TRUE, color = "b
 
 ```
 
+
 ### 4. Climate and Water Balance
 
 #### - Import previously selected GCMs
 
-Climate futures were previously compiled for park and Koppen centroids. This data was used to select which of the CMIP5 climate models to use to represent "hot dry" and "warm wet" scenarios. For CEBR, the park centroid was selected for determining which models to use.
+Climate futures were previously compiled for park and Koppen centroids. This data was used to select which of the CMIP5 climate models to use to represent "hot dry" and "warm wet" scenarios. For BRCA, the park centroid was selected for determining which models to use.
 
+Pre-determined climate futures for BRCA:
 
 ```{r}
 
 # Read in selected "Hot dry" "Warm Wet" climate futures
-hd_ww_cfs <- data.table::fread('data/parkwide_gcms.csv') %>%
+centroid_cfs <- data.table::fread('data/parkwide_gcms.csv') %>%
   dplyr::filter(park %in% {{park}},
                 CF %in% c("Warm Wet", "Hot Dry")) %>%
   distinct(GCM, .keep_all = TRUE)
 
 # If there is more than one model selection for a CF scenario, grab the more divergent.
-if (nrow(hd_ww_cfs) > 2) {
-  if (nrow(hd_ww_cfs %>% dplyr::filter(CF == "Hot Dry")) > 1) {
-    hd_ww_cfs <- hd_ww_cfs %>%
+if (nrow(centroid_cfs) > 2) {
+  if (nrow(centroid_cfs %>% dplyr::filter(CF == "Hot Dry")) > 1) {
+    centroid_cfs <- centroid_cfs %>%
       group_by(CF) %>%
       slice_min(delta_pr)
   }
-  if ((nrow(hd_ww_cfs %>% dplyr::filter(CF == "Warm Wet")) > 1) ) {
-    hd_ww_cfs <- hd_ww_cfs %>%
+  if ((nrow(centroid_cfs %>% dplyr::filter(CF == "Warm Wet")) > 1) ) {
+    centroid_cfs <- centroid_cfs %>%
       group_by(CF) %>%
       slice_max(delta_pr)
   }
@@ -838,14 +889,13 @@ all_cfs <-
 
 
 #### - Download climate data
-Get historical (GridMET) and future (MACA GCMs) climate data for the recharge area
+Get historical (GridMET) and future (MACA GCMs) climate data for the water supply watershed (i.e., the source area for the BRCA water supply).
 
 ```{r}
 
-recharge_area <- recharge_area %>% dplyr::mutate(name = "Recharge Area")
-
-# Get historical climate data for the recharge area
-clim_hist <- get_climate_historic(sf = recharge_area,
+# Get historical climate data for the Aquarius East fork of the Jemez River gage
+clim_hist <- get_climate_historic(sf = recharge_area %>% 
+                                   dplyr::mutate(name = "recharge_area"),
                                   col_name = "name",
                                   start = "1979-01-01",
                                   end = "2023-12-31") %>%
@@ -855,61 +905,81 @@ clim_hist <- get_climate_historic(sf = recharge_area,
 
 # Get future climate data for water source area for all GCMs 
 # TAKES > 1 hr -- ALready downloaded and import below
-clim_rch_fut <- get_climate_future(sf = recharge_area,
-                                      col_name = "name",
-                                      start = "2024-01-01",
-                                      end = "2100-12-31",
-                                      GCM = all_cfs$GCM) %>%
-  dplyr::mutate(GCM = paste0(GCM,'.',RCP)) %>%
-  dplyr::left_join(all_cfs, by = c("GCM", "RCP")) %>%
-  dplyr::select(-c("Ensemble","RCP")) 
+#clim_fut <- get_climate_future(sf = recharge_area %>% dplyr::mutate(name = "recharge_area"),
+#                                      col_name = "name",
+#                                      start = "2024-01-01",
+#                                      end = "2100-12-31",
+#                                      GCM = all_cfs$GCM) %>%
+#  dplyr::mutate(GCM = paste0(GCM,'.',RCP)) %>%
+#  dplyr::left_join(all_cfs %>% dplyr::select(-"RCP"), by = "GCM") %>%
+#  dplyr::select(-c("Ensemble","RCP")) 
+#saveRDS(clim_fut, "data/park/CEBR/Climate_Data/clim_fut_all.rds")
 
-saveRDS(clim_rch_fut, "data/park/CEBR/Climate_Data/clim_rch_fut.rds")
 # Read in all future data (previously downloaded)
-#clim_jemez_fut <- readRDS("data/park/CEBR/Climate_Data/clim_rch_fut.rds") 
+clim_fut <- readRDS("data/park/CEBR/Climate_Data/clim_fut_all.rds") 
+
+clim_snotel <- get_climate_historic(sf = snotel_sites %>% dplyr::filter(site == "1154"),
+                                    col_name = "site",
+                                    start = "1979-01-01",
+                                    end = "2023-01-01") %>%
+  dplyr::mutate(CF = "Historical",
+                GCM = "GridMET")
+
+
 
 # Extract unique grid center points for each dataset
-hist_pts <- clim_hist %>% 
+clim_pts <- clim_hist %>% 
   ungroup() %>% 
   distinct(x,y, .keep_all = TRUE) %>% 
   st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
   ungroup() %>%
   dplyr::select(x,y)
 
-jemez_fut_pts <- clim_jemez_fut %>% 
+clim_fut_pts <- clim_fut %>% 
   ungroup() %>% 
   distinct(x, y, .keep_all = TRUE) %>% 
   st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
   ungroup() %>%
   dplyr::select("old_x" = x, "old_y" = y)
 
+snotel_pts <- clim_snotel %>%
+  ungroup() %>%
+  distinct(x,y, .keep_all = TRUE) %>% 
+  st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
+  dplyr::select(x,y)
+
 # Because gridmet and MACA-CMIP5 points are slightly off, create updated single
 # set of points to use for both datasets - default to gridmet. This matters because
 # downstream, we're running a model that extracts soil properties, slope, 
 # aspect
-pts <- jemez_pts %>%
-  st_buffer(800) %>%
-  st_intersects(jemez_fut_pts) %>%
+
+### KEC: There is an issue here----> notably, climateR is not returning corresponding
+# grid cells for gridmet and maca despite inputting the same AOI. Need to look into why!
+# Buffer here is set to 6000 but should intersect at 2000
+pts <- clim_pts %>%
+  st_buffer(6000) %>%
+  st_intersects(clim_fut_pts) %>%
   imap_dfr(~ data.table(index_df1 = .y, index_df2 = .x)) %>%
-  right_join(jemez_pts %>% mutate(index_df1 = row_number()) %>% st_drop_geometry(), by = "index_df1") %>%
-  left_join(jemez_fut_pts %>% mutate(index_df2 = row_number()) %>% st_drop_geometry(), by = "index_df2") %>%
+  right_join(clim_pts %>% mutate(index_df1 = row_number()) %>% st_drop_geometry(), by = "index_df1") %>%
+  left_join(clim_fut_pts %>% mutate(index_df2 = row_number()) %>% st_drop_geometry(), by = "index_df2") %>%
   dplyr::select(-starts_with("index_")) %>%
   st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE)
 
-mapview(jemez_watershed) +
-mapview(jemez_fut_pts, col.regions = pal$gold) +
+mapview(recharge_area) +
+mapview(clim_fut_pts, col.regions = pal$gold) +
   mapview(pts, col.regions = pal$yellow) +
-  mapview(jemez_pts, col.regions = pal$pink)
+  #mapview(clim_pts, col.regions = pal$pink) +
+  mapview(st_bbox(st_buffer(pts, 2000)))
 
 # Reassign x and y as gridmet points (rather than cmip5)
-clim_jemez_fut <- clim_jemez_fut %>%
+clim_fut <- clim_fut %>%
   dplyr::rename("old_x"=x, "old_y" = y) %>%
   left_join(pts %>% st_drop_geometry(), by = c("old_x", "old_y")) %>%
   dplyr::ungroup() %>%
   dplyr::select(-c(old_x, old_y))
 
-clim_jemez_all <- clim_jemez %>%
-  bind_rows(clim_jemez_fut %>% dplyr::select(-c(Rank, Region, RCP, Skill)))
+clim_all <- clim_hist %>%
+  bind_rows(clim_fut %>% dplyr::select(-c(Rank, Region, Skill)))
 
 
 ```
@@ -926,18 +996,24 @@ For our report, we ran the NPS water balance model (WBM) for each GridMET point 
 
 load_wbm_rasters(crs = crs(pts))
 
-jemez_watershed_area <- jemez_watershed %>% 
+# NPS set the default to 4 based on the hock et al publication but we found that
+# 2 matches up better with snow accumulation at snotel sites and calibrates better
+# during runoff routing calibrations. Will continue to test in new regions, but
+# for Colorad, Utah, New Mexico, 2 is best fit
+hock <- 2
+
+recharge_area_ft2 <- recharge_area %>% 
   st_area() %>%
   set_units("ft^2") %>%
   as.numeric()
 
-jemez_wbm <- run_NPS_WBM_points(points = jemez_pts,
-                         climate_data = clim_jemez,
+recharge_wbm <- run_NPS_WBM_points(points = clim_pts,
+                         climate_data = clim_hist,
                          #col_name = "GCM", # CSU ADDITION
                          Direct_Frac = .1, # CSU ADDITION
                          Return_Rate = 1, # CSU ADDITION
                          PET_Method = "Oudin",
-                         hock_coef = 2,
+                         hock_coef = hock,
                          Snowpack.Init = 0, 
                          Soil.Init = 0,
                          Shade.Coeff = 1,
@@ -947,28 +1023,28 @@ jemez_wbm <- run_NPS_WBM_points(points = jemez_pts,
                          ret_final_cond = TRUE,
                                use_final = FALSE) 
 
-final_cond <- jemez_wbm[[2]] %>%
+final_cond <- recharge_wbm[[2]] %>%
   dplyr::select(x,y,final_soil, final_snowpack)
 
-jemez_pts <- jemez_pts %>% 
+clim_pts <- clim_pts %>% 
   dplyr::left_join(final_cond, by = c("x","y"))
 
-jemez_wbm <- jemez_wbm[[1]] %>%
-  dplyr::left_join(jemez_discharge %>% 
-                     dplyr::ungroup() %>% 
-                     dplyr::select(date, discharge_cfs),# %>%
-                   by = c("date")) %>%
+recharge_wbm <- recharge_wbm[[1]] %>%
+#  dplyr::left_join(jemez_discharge %>% 
+#                     dplyr::ungroup() %>% 
+#                     dplyr::select(date, discharge_cfs),# %>%
+#                   by = c("date")) %>%
   # Discharge in inches per day
-  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * jemez_watershed_area / 86400,
-    discharge_in = discharge_cfs * 86400 * 12 / jemez_watershed_area)
+  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400)
+    #discharge_in = discharge_cfs * 86400 * 12 / jemez_watershed_area)
 
-jemez_fut_wbm <- run_NPS_WBM_points(points = jemez_pts,
-                         climate_data = clim_jemez_fut,
+recharge_fut_wbm <- run_NPS_WBM_points(points = pts,
+                         climate_data = clim_fut,
                          #col_name = "GCM", # CSU ADDITION
                          Direct_Frac = .1, # CSU ADDITION
                          Return_Rate = 1, # CSU ADDITION
                          PET_Method = "Oudin",
-                         hock_coef = 2,
+                         hock_coef = hock,
                          Snowpack.Init = 0, 
                          Soil.Init = 0,
                          Shade.Coeff = 1,
@@ -976,12 +1052,30 @@ jemez_fut_wbm <- run_NPS_WBM_points(points = jemez_pts,
                          Soil_mult = 2,
                          PET_mult = 1,
                          ret_final_cond = FALSE,
-                         use_final = TRUE) %>%
-  # Discharge in inches per day
-  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * jemez_watershed_area / 86400)
+                         use_final = FALSE) %>%
+  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400)
+
+# test max infiltration rate - not used currently
+#max_inf <- .1 * (1/86400) * (1/12) * as.numeric((alluvium %>% st_area() %>% set_units("ft^2"))) # inches/day to cfs
 
 
-max_inf <- .1 * (1/86400) * (1/12) * as.numeric((alluvium %>% st_area() %>% set_units("ft^2"))) # inches/day to cfs
+snotel_wbm <- run_NPS_WBM_points(points = snotel_pts,
+                         climate_data = clim_snotel,
+                         #col_name = "GCM", # CSU ADDITION
+                         Direct_Frac = .1, # CSU ADDITION
+                         Return_Rate = 1, # CSU ADDITION
+                         PET_Method = "Oudin",
+                         hock_coef = hock,
+                         Snowpack.Init = 0, 
+                         Soil.Init = 0,
+                         Shade.Coeff = 1,
+                         T.Base = 0,
+                         Soil_mult = 2,
+                         PET_mult = 1,
+                         ret_final_cond = FALSE,
+                               use_final = FALSE) 
+
+
 
 ```
 
@@ -993,9 +1087,9 @@ First calculate differentials (future - baseline) for all climate & WBM data sta
 ```{r}
 
 # wbm_all pre-routing
-wbm_all <- jemez_wbm %>%
-  dplyr::select(-c(, discharge_cfs, runoff_cfs_wbm, discharge_in)) %>%
-  bind_rows(jemez_fut_wbm) %>%
+wbm_all <- recharge_wbm %>%
+  #dplyr::select(-c(, discharge_cfs, runoff_cfs_wbm)) %>%
+  bind_rows(recharge_fut_wbm) %>%
   as.data.table() %>%
   left_join(all_cfs, by = "GCM")
 
@@ -1047,16 +1141,16 @@ future_differentials <- future %>%
                 delta_runoff_in_peak = peak_runoff_in - baseline$peak_runoff_in,
                 delta_precip_minus_pet = mean_precip_minus_pet_in - baseline$mean_precip_minus_pet_in,
                 delta_fract_zero_runoff = fract_zero_runoff - baseline$fract_zero_runoff) %>%
-  dplyr::left_join(hd_ww_cfs %>% dplyr::select(GCM, CF), by = "GCM") %>%
-  dplyr::rename(c("GCM_Meta" = CF)) %>%
-  dplyr::mutate(GCM_Meta = ifelse(GCM_Meta %in% c("Hot Dry","Warm Wet"), GCM_Meta , 
+  dplyr::left_join(centroid_cfs %>% dplyr::select(GCM, CF), by = "GCM") %>%
+  dplyr::rename(c("centroid_cf" = CF)) %>%
+  dplyr::mutate(centroid_cf = ifelse(centroid_cf %in% c("Hot Dry","Warm Wet"), centroid_cf , 
                             ifelse(Skill == "Low Skill", "Low Skill", "Other"))) %>%
   dplyr::mutate(RCP = str_sub(GCM, -5))
                           
 ```
 
 
-now, assign climate future categories
+now, manually select climate future categories
 
 ```{r}
 
@@ -1083,8 +1177,14 @@ low_y = "Dry"
 
 selected_gcms <- select_cfs_deep_dive(df = future_differentials, x, y, x_name, y_name, high_x, low_x, high_y, low_y, to_plot = TRUE)
 
-
-
+# Add to future_differentials
+future_differentials <- future_differentials %>% 
+  dplyr::left_join(selected_gcms[[1]] %>% 
+                     dplyr::filter(CF %in% c("Hot Dry", "Warm Wet")) %>% 
+                     dplyr::select(c(GCM, "select_CF" = CF)), by = "GCM") %>%
+  dplyr::mutate(GCM_Meta = case_when(centroid_cf == "Low Skill" ~ "Low Skill",
+                                     !is.na(select_CF) ~ select_CF,
+                                     TRUE ~ "Other")) # CF, GCM_Meta))
 
 ```
 
@@ -1108,7 +1208,7 @@ a <- ggplot(wbm_all_plot, aes(x = year, y = runoff_in_wbm, group = GCM)) +
 a
 
 
-ggsave("docs/Deep Dives/VALL/Figs/GCM_EXPLORATION_RUNOFF_THROUGH_TIME.jpg",a, width = 7, height = 4,  dpi = 600)
+ggsave("docs/Deep Dives/CEBR/Figs/GCM_EXPLORATION_RUNOFF_THROUGH_TIME.jpg",a, width = 7, height = 4,  dpi = 600)
 
 
 # Density of runoff
@@ -1124,57 +1224,283 @@ ggplot() +
 
 ```
 
+# 5. Tables
+
+# 6. Figures
 
 
+##### Differentials Figure
 
-##### Figure 2
+differentials bar chart - not officially in report yet so keeping here
+Note, fill = GCM_Meta shows CFS selected using the recharge area climate futures. fill = centroid_cf shows CFs selected using park centroid. Notably, selections are different AND neither selects the maximum runoff for the park. Interesting.... I wonder if this is related to a snow-dominated, higher elevation setting where the effects of PET are less pronounced on runoff and therefore what we actually want is just maximum P.
+
+```{r figure_3}
+
+diff_plot <- ggplot(future_differentials, aes(x = reorder(GCM, delta_runoff_in), 
+                                                   y = 365.25 * delta_runoff_in, 
+                                              fill = GCM_Meta)) +
+                                              #fill = centroid_cf)) +  
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  #theme(legend.position = "none") + 
+  labs(x = "", y = "Change in Annual Runoff (in)") +
+  theme(axis.text.x = element_text(angle = 76, vjust = 0.5, hjust=.5)) +
+  scale_fill_manual("", values = c(nps_pal$red,"black", "gray80", nps_pal$blue), na.value="gray85")
+
+diff_plot
+
+ggsave("docs/Deep Dives/CEBR/Figs/Diff_plot.tif", diff_plot, width = 7, height = 4,  dpi = 600)
+
+```
+
+
+##### Site Figure
 
 A map of the
 
 ```{r figure_2}
-## Download tiles and compose basemap raster (high res, takes a few seconds)
-tile_maps <- get_tiles(x = park_boundary, provider =  "Esri.WorldTopoMap", zoom = 12)
 
-## Download springs from:
-# https://irma.nps.gov/DataStore/Reference/Profile/1016840
-springs <- st_read("data/park/BRCA/brca_wqgis", layer = "spring") %>%
-  drop_na(NAME1_) %>%
-  dplyr::filter(NAME1_ %in% c("Shaker Spring", "Trough Spring", "Whiteman Spring")) %>% 
-  mutate(NAME1_ = str_replace(NAME1_, " Spring", ""))
-st_crs(springs) <- "EPSG:26912"
+fig_aoi <- park_boundary %>%
+  dplyr::ungroup() %>%
+  st_union(recharge_area %>% st_transform(crs = st_crs(park_boundary))) %>%
+  dplyr::summarize() %>%
+  st_buffer(3000) 
+
+mapview(fig_aoi)
+
+## Download tiles and compose basemap raster (high res, takes a few seconds)
+#tile_maps <- get_tiles(x = fig_aoi, provider =  "Esri.WorldTopoMap", zoom = 13, project = FALSE)
+#tile_maps <- get_tiles(x = park_boundary %>% st_buffer(5000), provider = "OpenTopoMap", zoom = 12)
+tile_maps <- maptiles::get_tiles(x = fig_aoi, 
+                                 provider =  "Esri.WorldTopoMap", 
+                                 zoom = 13, retina = TRUE)
+tile_maps2 <- maptiles::get_tiles(x = fig_aoi, 
+                                  provider = "Esri.WorldShadedRelief", 
+                                  zoom = 13, project = FALSE)
+
+# Make individual maps objs because these are repeated in multiple figs
+basemap <- tm_shape(tile_maps, 
+                    bbox = st_bbox(fig_aoi)) +
+  tm_rgb() +
+  tm_shape(tile_maps2) + 
+  tm_rgb(col_alpha = 0.2)
+
+pb_map <- tm_shape(park_boundary) +
+  tm_polygons("UNIT_NAME",
+              fill.scale = tm_scale_categorical(values = c(pal$teal)), 
+              fill_alpha = 0, 
+              lwd = 2, 
+              fill.legend = tm_legend(show = FALSE, title = "", stack = "vertical")) 
+
+rch_map <- tm_shape(recharge_area %>% 
+                      dplyr::mutate(name = "Recharge Area") %>% 
+                      st_transform(3857)) +
+  tm_polygons("name",
+              fill.scale = tm_scale_categorical(values = c(pal$lightblue)),
+              fill_alpha = 0,
+              col = "dodgerblue",
+              lwd = 2, 
+              fill.legend = tm_legend(show = TRUE, title = "", 
+                                      stack = "vertical")) +
+  tm_labels("Recharge Area",
+            size = 0.75, 
+            remove.overlap = TRUE, 
+            xmod = .1, ymod = -.2, 
+            fontface = 3)
+
+bh_map <- tm_shape(source_table_locs %>% st_transform(3857)) +
+  tm_dots(fill = pal$black,
+          size = .7,
+          border.col = "white",
+          lwd = 2,
+          shape = 23) +
+  tm_labels("Blowhard Spring", 
+            size = 0.75, 
+            remove.overlap = TRUE, 
+            bgcol = "white",
+            bgcol_alpha = .5, xmod = -.2, ymod = -.2, options = opt_tm_text(just = c("right", "top")))
+
+claron_map <- tm_shape(nps_geo %>% 
+              dplyr::filter(GLG_SYM %in% claron) %>% 
+              st_transform(3857) %>%
+              dplyr::summarize() %>% dplyr::mutate(name = "Claron Fm.")) +
+  tm_polygons("name",
+              fill.scale = tm_scale_categorical(values = c(pal$yellow)),
+              fill_alpha = .4,
+              lwd = 0,
+              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
+
+alluv_map <- tm_shape(nps_geo %>% dplyr::filter(GLG_SYM %in% q_colluv) %>% 
+             dplyr::summarize() %>% 
+             st_transform(3857) %>%
+             dplyr::mutate(name = "Colluvium/Alluvium")) +
+  tm_polygons("name",
+              fill.scale = tm_scale_categorical(values = c(pal$pink)),
+              fill_alpha = .4,
+              lwd = 0,
+              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
+
+fault_map <- tm_shape(nps_faults %>%
+             st_transform(3857) %>%
+             dplyr::mutate(name = "Faults")) +
+  tm_lines("name",
+           lwd = 2,
+           col = "black",
+           col_alpha = .6) +
+  tm_shape(park_flowlines %>% st_transform(3857) ) + #%>% group_by(GNIS_Name) %>% dplyr::filter(NHDPlusID == max(NHDPlusID)) %>% #bind_cols(p_ang = c(43,-35,0,30,-20, 0,-30))) +
+  tm_lines(lwd = 0.5, col = pal$lightblue)
+
+rch_elev_map <- tm_shape(thresh_elev) +
+  tm_raster("Elevation",
+            col.scale = tm_scale_continuous(values = hcl.colors(9, palette = "Blues 2")))
+
+lg_map <- tm_compass(position  =c(.9,.2), text.size = 0.9, ymod = 1) +
+  tm_scalebar(position = c("right", "bottom"), text.size = .9) +
+  tm_layout(frame = FALSE, 
+            legend.position = c(.65,.98), 
+            legend.just = c("left","top"), 
+            legend.text.size = 0.9, 
+            legend.outside.size = 0.2, 
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.9,
+            legend.outside = FALSE)
+ 
+
+# Build figs
+
+# 1. Site Figure
+site_fig <- basemap +
+  pb_map +
+  rch_map +
+  bh_map +
+  lg_map
+
+site_fig
+
+tmap_save(site_fig, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Site_Fig.png", width = 6.5, height = 6.6)
+
+# 2. Geology Figure
+
+geo_fig <- basemap +
+  claron_map +
+  alluv_map +
+  pb_map +
+  rch_map +
+  bh_map +
+  lg_map
+
+geo_fig
+
+tmap_save(geo_fig, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Geo_Fig.png", width = 6.5, height = 6.6)
+
+# 3. Rch Elev Fig
+
+rch_fig <- basemap +
+  rch_elev_map +
+  pb_map +
+  rch_map +
+  bh_map +
+  lg_map
+
+rch_fig
+
+tmap_save(rch_fig, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Rch_Fig.png", width = 6.5, height = 6.6)
+
+
+```
+
+
+```{r}
+
+figure_2 + 
+ 
+
+```
+
+
+A map of the recharge area with elevation
+
+```{r figure_2b}
+
 
 ## Create map
-figure_2 <- tm_shape(tile_maps) + 
+figure_2b <-
+  # Basemap
+  tm_shape(tile_maps, 
+           bbox = st_bbox(fig_aoi)) +
   tm_rgb() +
-  tm_shape(park_boundary) +
-  tm_polygons(col = pal$teal, alpha = 0.5, lwd = 0.5, style = "pretty") +
-  tm_shape(source_table_locs$aoi %>% bind_rows() %>%
-             dplyr::mutate(name = ifelse(type == "Formation", "Alluvium", 
-                                         "East Creek Watershed"))) +
-  tm_polygons("name", palette= c(pal$lightblue, pal$gold), style="cat", alpha = 0.5, legend.show = FALSE, lwd = 0) +
-  tm_shape(springs) +
-  tm_dots(size = 0.4, col = pal$yellow, border.col = "black", border.lwd = 0.4, shape = 21) +
-  tm_text("NAME1_", size = 0.5, xmod = 1.1) +
-  tm_shape(source_table_locs) +
-  tm_dots(col = pal$black,
-          #alpha = 0.75,
-          size = 0.5,
+  #tm_shape(tile_maps2) + 
+  #tm_rgb(col_alpha = 0.1) +
+  tm_shape(thresh_elev) +
+  tm_raster("Elevation",
+            col.scale = tm_scale_continuous(values = hcl.colors(9, palette = "Blues 2"))) +
+  #tm_labels("Valle Grande", size = 0.75, remove.overlap = TRUE, xmod = .1, ymod = -.2, fontface = 3) +
+  tm_shape(nps_faults %>%
+             st_transform(3857) %>%
+             dplyr::mutate(name = "Faults")) +
+  tm_lines("name",
+           lwd = 2,
+           col = "black",
+           col_alpha = .6) +
+  tm_shape(park_flowlines %>% st_transform(3857) ) + #%>% group_by(GNIS_Name) %>% dplyr::filter(NHDPlusID == max(NHDPlusID)) %>% #bind_cols(p_ang = c(43,-35,0,30,-20, 0,-30))) +
+  tm_lines(lwd = 0.5, col = pal$lightblue) +
+  #tm_labels("GNIS_Name", remove.overlap = TRUE, size = 0.77, col = pal$darkblue, fontface = "bold.italic", angle = "p_ang") +
+  #tm_text("GNIS_Name", remove.overlap = TRUE, size = 0.75, col = pal$darkblue, 
+  #        angle = "p_ang", 
+  #        #options = opt_tm_text(along_lines = TRUE), # can't get this to work.
+  #        fontface = "bold",xmod = -.3, ymod = -.3) +
+  tm_shape(source_table_locs %>% st_transform(3857)) +
+  tm_dots(fill = pal$black,
+          size = .7,
           border.col = "white",
-          border.lwd = 0.4,
+          lwd = 2,
           shape = 23) +
-  tm_scale_bar(position = c("left", "bottom"), text.size = 0.6) +
-  tm_compass(position  =c("left", "top"), text.size = 0.6) +
-  tm_add_legend("fill", col = pal$teal, labels = "BRCA Park Boundary", size = 0.4, border.lwd = 0, alpha = 0.75) +
-  tm_add_legend("fill", col = pal$lightblue, labels = "East Creek Watershed", size = 0.4, border.lwd = 0, alpha = 0.75) +
-  tm_add_legend("fill", col = pal$gold, labels = "Alluvium", size = 0.4, border.lwd = 0, alpha = 0.75) +
-  tm_add_legend("symbol", col = pal$black, labels = "East Creek Supply Wells", size = 0.4, border.lwd = 0, shape = 23) +
-  tm_add_legend("symbol", col = pal$yellow, labels = "Springs", size = 0.4, border.col = "black", border.lwd = 0.2, shape = 21) +
-  tm_layout(frame = FALSE, legend.position = c("right", "bottom"), legend.width = 0.68, legend.text.size = 0.6)
+  tm_labels("Blowhard Spring", size = 0.75, remove.overlap = TRUE, bgcol = "white", bgcol_alpha = .5, xmod = -.2, ymod = -.2, options = opt_tm_text(just = c("right", "top"))) +
+  #tm_labels("Redondo Peak", size = 0.75, remove.overlap = FALSE, xmod = -.5, ymod = .2, fontface = 3, options = opt_tm_text(just = c("right", "top"))) +
+#  tm_shape(jemez_gage) +
+#  tm_dots(col = pal$darkblue,
+#          size = .7,
+#          border.col = "white",
+#          lwd = 2,
+#          shape = 21) +
+ # tm_labels("Jemez Gage", size = 0.75, remove.overlap = TRUE, bgcol = "white", bgcol_alpha = .5, xmod = -.2, ymod = -.2, options = opt_tm_text(just = c("right", "top"))) +
+  # Recharge Area
+  tm_shape(recharge_area %>% 
+             dplyr::mutate(name = "Recharge Area") %>%
+             st_transform(3857)) +
+  tm_polygons("name",
+              fill.scale = tm_scale_categorical(values = c(pal$lightblue)),
+              fill_alpha = 0,
+              col = "dodgerblue",
+              lwd = 2, 
+              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) +
+  tm_labels("Recharge Area", size = 0.75, remove.overlap = TRUE, xmod = .1, ymod = -.2, fontface = 3) +
+  tm_shape(park_boundary) +
+  tm_polygons("UNIT_NAME",
+    fill.scale = tm_scale_categorical(values = c(pal$teal)), 
+              fill_alpha = 0, 
+              lwd = 2, 
+              fill.legend = tm_legend(show = FALSE, title = "", stack = "vertical")) +
+  
+  tm_compass(position  =c(.9,.2), text.size = 0.9, ymod = 1) +
+  tm_scalebar(position = c("right", "bottom"), text.size = .9) +
+  tm_layout(frame = FALSE, 
+            legend.position = c(.65,.98), 
+            legend.just = c("left","top"), 
+            legend.text.size = 0.9, 
+            legend.outside.size = 0.2, 
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.9,
+            legend.outside = FALSE)
 
-#figure_2
+figure_2b
 
-tmap_save(figure_2, dpi = 600, filename = "docs/Deep Dives/BRCA/Figs/Figure_2.png", width = 4, height = 7)
+
+tmap_save(figure_2, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Site_Fig.png", width = 6.5, height = 6.6)
+
 ```
+
+
 
 ### 3. Grab additional datasets
 
@@ -1270,3 +1596,13 @@ mapview(POD_state,
           homebutton = FALSE,
           alpha.regions = 0.2)
 ```
+
+
+# Save data
+```{r}
+
+save.image(file="data/park/CEBR/CEBR_report_data.RData")
+
+```
+
+
