@@ -122,10 +122,9 @@ source_table_locs <- source_table_locs %>%
                   purrr::map(.x = 1:nrow(.),
                              .f = ~ getXYWatersheds(sf = source_table_locs[.x,], 
                                                     coordinates = NULL, 
-                                                    snap = FALSE, 
-                                                    clip = TRUE)))
+                                                    snap = FALSE)))
 
-all_watersheds <- getWatersheds(aoi = park_boundary)
+all_watersheds <- getAOIWatersheds(aoi = park_boundary)
 
 # Plot - 
 mapview(all_watersheds, col.regions = "seagreen") +
@@ -513,7 +512,7 @@ duck_creek_watershed <- data.frame(name = "duck_creek",
                          long = c(-112.65649),
                          lat = c(37.52964)) %>%
   st_as_sf(coords = c("long","lat"), crs = 4326) %>%
-  getXYWatersheds()
+  getXYWatersheds(sf = ., snap = TRUE)
 
 
 mapview(mammoth_creek_watershed %>% dplyr::mutate(name = "Mammoth Creek"),
@@ -526,13 +525,17 @@ mapview(mammoth_creek_watershed %>% dplyr::mutate(name = "Mammoth Creek"),
           col.regions = pal$orange,
           layer.name = "Coal Creek") +
   #mapview(north_fork_virgin_watershed) +
-  mapview(duck_creek_watershed,
-          col.regions = pal$darkblue,
-          layer.name = "Duck Creek") +
+#  mapview(duck_creek_watershed,
+#          col.regions = pal$darkblue,
+#          layer.name = "Duck Creek") +
 mapview(park_boundary, alpha.regions = 0, lwd = 4, layer.name = "CEBR", col.regions = "black") +
   mapview(source_table_locs,
           col.regions = "black",
-          layer.name = "Blowhard Spring")
+          layer.name = "Blowhard Spring") + 
+  mapview(all_watersheds, col.regions = "pink")
+
+
+
 
 # Download data from reference stream sites
 nwis_select_discharge <- 
