@@ -29,9 +29,11 @@ getPODUtah <- function(aoi, dist = 0){
     sf::st_as_sfc(filter_geom) %>% 
     .[[1]] %>% 
     arcgisutils::as_esri_geometry()
-  
+ 
   ## create the rest API
-  url <- paste0("https://services.arcgis.com/ZzrwjTRez6FJiOq4/ArcGIS/rest/services/PODservice/FeatureServer/0/query?returnGeometry=true&where=1=1&outFields=*&f=geojson&geometry=",
+  # see: https://hub.arcgis.com/datasets/utahDNR::utah-points-of-diversion/about
+  url <- paste0("https://services.arcgis.com/ZzrwjTRez6FJiOq4/arcgis/rest/services/Utah_Points_of_Diversion/FeatureServer/0",
+                "/query?returnGeometry=true&where=1=1&outFields=*&f=geojson&geometry=",
                 filter_geom,
                 "&geometryType=esriGeometryPolygon&inSR=4326&spatialRel=esriSpatialRelIntersects")
   
