@@ -15,15 +15,19 @@ listNWIS <- function(aoi = NULL, dist, states = NULL, sites = NULL){
     janitor::clean_names() %>%
     dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
   
-  site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
+  # site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
+  # 
+  # table <- rvest::read_html(site_url) %>%
+  #   rvest::html_nodes('table') %>%
+  #   rvest::html_table()
+  # 
+  # table <- rbind(table[[1]], table[[2]], table[[3]], table[[4]], table[[5]]) %>%
+  #   dplyr::select(site_type_cd = 1,
+  #                 site_type = 2)
   
-  table <- rvest::read_html(site_url) %>%
-    rvest::html_nodes('table') %>%
-    rvest::html_table()
-  
-  table <- rbind(table[[1]], table[[2]], table[[3]], table[[4]], table[[5]]) %>%
+  table <- read_waterdata_metadata("site-types") %>%
     dplyr::select(site_type_cd = 1,
-                  site_type = 2)
+                  site_type = 3)
   
   # Grab NWIS by an area of interest:
   if(!is.null(aoi)){
