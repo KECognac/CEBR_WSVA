@@ -7,13 +7,17 @@
 #' @return An sf object of USGS gaging stations within given spatial boundary and attributes
 listNWIS <- function(aoi = NULL, dist, states = NULL, sites = NULL){
   
-  tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
-    rvest::html_nodes('table') %>%
-    rvest::html_table()
+  #tables <- rvest::read_html('https://help.waterdata.usgs.gov/parameter_cd?group_cd=%') %>%
+  #  rvest::html_nodes('table') %>%
+  #  rvest::html_table()
   
-  pcodes <- tables[[1]] %>%
+  #pcodes <- tables[[1]] %>%
+  #  janitor::clean_names() %>%
+  #  dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
+  
+  pcodes <- dataRetrieval::parameterCdFile %>% 
     janitor::clean_names() %>%
-    dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_code), 5, pad = "0"))
+    dplyr::mutate(parm_cd = stringr::str_pad(as.character(parameter_cd), 5, pad = "0"))
   
   # site_url <- 'https://maps.waterdata.usgs.gov/mapper/help/sitetype.html'
   # 
@@ -68,7 +72,8 @@ listNWIS <- function(aoi = NULL, dist, states = NULL, sites = NULL){
                       n_obs = count_nu,
                       begin_date,
                       end_date,
-                      parameter = parameter_name_description,
+                      #parameter = parameter_name_description,
+                      parameter = parameter_nm,
                       code = parm_cd)) %>%
       dplyr::left_join(.,table,by = 'site_type_cd') %>%
       dplyr::mutate(data_type = dplyr::case_when(data_type_cd == "dv" ~ "Daily",
@@ -108,7 +113,8 @@ listNWIS <- function(aoi = NULL, dist, states = NULL, sites = NULL){
                         n_obs = count_nu,
                         begin_date,
                         end_date,
-                        parameter = parameter_name_description,
+                        #parameter = parameter_name_description,
+                        parameter = parameter_nm,
                         code = parm_cd))
     }) %>%
       dplyr::left_join(., table, by = 'site_type_cd') %>%
@@ -150,7 +156,8 @@ listNWIS <- function(aoi = NULL, dist, states = NULL, sites = NULL){
             n_obs = count_nu,
             begin_date,
             end_date,
-            parameter = parameter_name_description,
+            #parameter = parameter_name_description,
+            parameter = parameter_nm,
             code = parm_cd
           )
         )
