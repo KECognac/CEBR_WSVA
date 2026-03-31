@@ -43,45 +43,19 @@ if (nrow(nwis_groundwater) > 35000) {
   nwis_groundwater_meta <- get_well_meta(gw_list = nwis_groundwater)
 }
  
-# Next get aquifer name from USGS database
-  
-# Read USGS aquifer code webpage using rvest
-url <- "https://help.waterdata.usgs.gov/aqfr_cd"
-webpage <- read_html(url)
-
-# Extract and clean table containing aquifer codes
-aquifer_table <- webpage %>%
-  html_nodes("table") %>%  
-  .[[1]] %>%                    # Select the first table
-  html_table(fill = TRUE) %>%   # Extract table data
-  data.table() %>%
-  mutate("State Code" = as.character(`State Code`))
+# Next get aquifer metadata 
+aquifer_table <- read_waterdata_metadata("aquifer-codes")
+national_table <- read_waterdata_metadata("national-aquifer-codes")
+aquifer_types <- read_waterdata_metadata("aquifer-types")
+#hucs <- read_waterdata_metadata("hydrologic-unit-codes")
 
 nwis_groundwater_meta <- nwis_groundwater_meta %>%
   dplyr::left_join(., aquifer_table, 
-             by = c("aqfr_cd" = "Local Aquifer Code", 
-                    "state_cd" = "State Code"))
-
-
-
-
-# Next add aquifer type code description, from:
-# https://help.waterdata.usgs.gov/code/aqfr_type_cd_query?fmt=rdb&inline=true
-
-aquifer_type_codes <- data.frame(
-  code = c('C', 'M', 'N', 'U', 'X'),
-  desc = c('Confined single aquifer',
-            'Confined multiple aquifers',
-            'Unconfined multiple aquifer',
-            'Unconfined single aquifer',
-            'Mixed (confined and unconfined) multiple aquifers'
-            )
-)
-
-nwis_groundwater_meta <- nwis_groundwater_meta %>%
-  dplyr::left_join(aquifer_type_codes, by = c("aqfr_type_cd" = "code")) %>%
-  # should never me empty. 
-  filter(!is.na(huc_cd))
+             by = c("aqfr_cd" = "aquifer_code")) %>%
+  dplyr::left_join(., national_table,
+                   by = c("nat_aqfr_cd" = "national_aquifer_code")) %>%
+  dplyr::left_join(aquifer_types, 
+                   by = c("aqfr_type_cd" = "aquifer_type"))
 
 
 
