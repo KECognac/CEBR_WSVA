@@ -12,7 +12,7 @@ This R markdown prepares data and figures contained within the report, Climate C
 ```{r setup}
 knitr::opts_chunk$set(echo = TRUE,  message = FALSE, warning = FALSE, eval = TRUE)
 
-#load("data/park/CEBR/CEBR_report_data.RData")
+load("data/park/CEBR/CEBR_report_data.RData")
 
 # Load functions after park files in case functions were updated since last save.
 source('setup.R')
@@ -42,6 +42,10 @@ nps_pal <-list(blue = "#85b6dc",
 # define conversions
 gal_to_cf <- 0.133681
 
+# Define time periods
+hist_yrs <- c(1979, 2012)
+fut_yrs <- c(2035, 2065)
+
 ```
 
 Define park using 4-digit NPS Unit Code. Codes for all parks can be found at: <https://www.nps.gov/aboutus/foia/upload/NPS-Unit-List.xlsx>.
@@ -66,14 +70,12 @@ A water supply system database was created for this project using various NPS an
 table_path <- "data/Water_Supply_Systems/NPS_Water_Systems_Database_Joined.xlsx"
 
 # Import table with water supply source locations and filter to CEBR
-source_table_locs <- read_excel(table_path, sheet = 1, na = "NA", skip = 1) %>%
-  as.data.frame() %>%
-      dplyr::filter(park_unit == park,
-                    !source_type %in% c("hauled","Hauled")) %>%
-     drop_na(c("source_longitude", "source_longitude")) %>%
-    st_as_sf(coords = (c("source_longitude","source_latitude")),
-           crs = 4326,
-            remove = FALSE) 
+source_table_locs <- read_excel(table_path, sheet = 1, na = c("NA","U"), skip = 1) %>%
+  dplyr::filter(park_unit == park,
+                !source_type %in% c("hauled","Hauled")) %>%
+  drop_na(source_longitude, source_latitude) %>%
+  st_as_sf(coords = c("source_longitude", "source_latitude"), 
+           crs = 4326, remove = FALSE)
 
 ```
 
@@ -101,12 +103,18 @@ springs <- read_csv("data/park/CEBR/springs.csv") %>%
   drop_na(utm_n_12_s) %>%
   st_as_sf(coords = c("utm_e_12s", "utm_n_12_s"), crs = 26912) %>%
   dplyr::mutate(description = as.character(description)) %>%
-  st_transform(crs = 4326)
+  st_transform(crs = 4326) %>%
+  distinct(spring_name, .keep_all = TRUE)
 
 # Import springs from the spring stewardship institute database
 SSI_springs <- read_csv("data/park/ZION/SSI_SW_Utah.csv") %>%
   clean_names() %>%
   st_as_sf(coords = c("longitude_dd","latitude_dd"), crs = 4326)
+
+springs_joined <- springs %>%
+  bind_rows(SSI_springs) %>%
+  dplyr::mutate(new_name = coalesce(short_name, spring_name)) %>%
+  distinct(new_name, .keep_all = TRUE)
 
 ```
 
@@ -116,19 +124,32 @@ Get watershed associated with the water supply point and other watersheds that o
 
 ```{r watersheds}
 
-# Delineate the watershed 
-source_table_locs <- source_table_locs %>%
-  dplyr::mutate(watershed = 
-                  purrr::map(.x = 1:nrow(.),
-                             .f = ~ getXYWatersheds(sf = source_table_locs[.x,], 
-                                                    coordinates = NULL, 
-                                                    snap = FALSE)))
+#watersheds_flow_into_park <- getAOIWatersheds(aoi = park_boundary)
 
-all_watersheds <- getAOIWatersheds(aoi = park_boundary)
+watersheds <- get_huc(AOI = park_boundary, type = "huc10")
 
-# Plot - 
-mapview(all_watersheds, col.regions = "seagreen") +
-mapview(source_table_locs$watershed) 
+#FCode	Description
+#46006	Stream/River: Perennial
+#46003	Stream/River: Intermittent
+#46007	Stream/River: Ephemeral
+
+park_flowlines <- park_boundary %>%
+  st_buffer(10000) %>%
+  st_bbox() %>%
+  st_as_sfc() %>%  
+  st_as_sf() %>%
+  dplyr::summarize() %>%
+  mapNHDPlusHR() 
+
+# Plot 
+mapview(all_watersheds, 
+        col.regions = "seagreen") +
+  mapview(park_flowlines %>% dplyr::filter(FCode == 46006),
+          color = "steelblue",
+          layer.name = "Perennial Flow")
+
+
+
 ```
 
 #### - Geology
@@ -218,7 +239,8 @@ mapview(nps_faults,
         color = "black") +
   mapview(springs[,1:2], 
           col.regions = "red",
-          layer.name = "Springs")
+          layer.name = "Springs",
+          cex = 2)
 
   addStaticLabels(a,
                   label = source_table_locs$source_name,
@@ -444,6 +466,8 @@ ggplot(snotel_an %>%
  
 
 rm(snotel)
+gc()
+
 
 ```
 
@@ -465,98 +489,73 @@ For many parks, the nearest USGS stream gage is far away. Therefore, here we pul
 
 ```{r nwis, eval = TRUE, message = FALSE, warning = FALSE}
 
-# Get all NWIS sites
+
+# --- 1. Site Selection ---
 nwis <- listNWIS(aoi = park_boundary, dist = 30000) 
 
-########################## Surface Water #######################################
-
-# Get NWIS Stream Gages - Note, this removes all relevant gages for CEBR so not
-# adhering to reference gages only.
-ref_gages <- get_gagesII(id = unique(nwis$site_no)) %>%
-  dplyr::filter(class == "Ref")
-
-# Select by maximum record and distance from supply site
+# Filter for daily value (dv) data and specific stream codes
 nwis_select_stream_gage <- nwis %>%
-  dplyr::filter(#site_no %in% ref_gages$staid,
-                data_type_cd == "dv",
-                code %in% c("00060", "00054")) %>%
-  dplyr::filter(site_no %in% c(#"10241800",
-                               "10242000",
-                               "10173450"))
+  filter(
+    data_type_cd == "dv",
+    code %in% c("00060", "00054"),
+    site_no %in% c("10242000", "10173450")
+  )
 
-# Get watersheds associated with nearest stream gages
+# --- 2. Watershed Delineation & Metrics ---
+# Get watersheds and calculate area in one pipeline
 nwis_select_watershed <- nwis_select_stream_gage$site_no %>%
-  purrr::map_dfr(~ nldi_finder(site_no = .)) %>%
-  dplyr::left_join(sf::st_drop_geometry(nwis_select_stream_gage), 
-                   by = "site_no") %>%
-  dplyr::mutate(drain_sqkm = st_area(geometry) %>% 
-                  set_units("km^2") %>% 
-                  as.numeric())
+  map_dfr(~ nldi_finder(site_no = .x)) %>%
+  left_join(st_drop_geometry(nwis_select_stream_gage), by = "site_no") %>%
+  mutate(
+    drain_sqkm = geometry %>% 
+      st_area() %>% 
+      set_units("km^2") %>% 
+      as.numeric()
+  )
 
-# Load NHD flowlines and filter for specific reaches within the watershed. We
-# will use these to select subsets of the alluvium for a volume analysis.
-park_flowlines <- park_boundary %>%
-  st_buffer(4000) %>%
-  dplyr::summarize() %>%
-  mapNHDPlusHR() 
-
-#watersheds <- getWatersheds(aoi = st_buffer(park_boundary, 10000))
+# --- 3. Individual Watersheds ---
 
 
+
+# Consolidate manual watershed point creation
+duck_creek_watershed <- tibble(name = "duck_creek", long = -112.65649, lat = 37.52964) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+  getXYWatersheds(snap = TRUE)
+
+# Watersheds for plotting
 mammoth_creek_watershed <- nldi_finder(site_no = 10173450)
-sevier_watershed <- nldi_finder(site_no = 10174500)
-navajo_lake <- nldi_finder(site_no = 10173800)
-coal_creek_watershed <- nldi_finder(site_no = 10242000)
-north_fork_virgin_watershed <- nldi_finder(site_no = 371705112565001)
-duck_creek_watershed <- data.frame(name = "duck_creek",
-                         long = c(-112.65649),
-                         lat = c(37.52964)) %>%
-  st_as_sf(coords = c("long","lat"), crs = 4326) %>%
-  getXYWatersheds(sf = ., snap = TRUE)
+coal_creek_watershed    <- nldi_finder(site_no = 10242000)
 
+# --- 4. Discharge Data Processing ---
+# Download and join watershed area for depth-normalized runoff
+nwis_select_discharge <- readNWISdv(
+    siteNumbers = nwis_select_stream_gage$site_no,
+    parameterCd = '00060'
+  ) %>%
+  rename(discharge = X_00060_00003, date = Date) %>%
+  left_join(st_drop_geometry(nwis_select_watershed), by = "site_no") %>%
+  mutate(
+    # Convert cfs to inches/day: (cfs * sec_in_day * inches_per_ft) / (sq_km to sq_ft)
+    discharge_in_nwis = (86400 * 12 * discharge) / (drain_sqkm * 1.076e+7)
+  )
 
-mapview(mammoth_creek_watershed %>% dplyr::mutate(name = "Mammoth Creek"),
-        zcol = NULL,
-        col.regions = pal$lightblue,
-        layer.name = "Mammoth Creek") +
-  #mapview(sevier_watershed) +
-  mapview(coal_creek_watershed %>% dplyr::mutate(name = "Coal Creek"),
-          zcol = NULL,
-          col.regions = pal$orange,
-          layer.name = "Coal Creek") +
-  #mapview(north_fork_virgin_watershed) +
-#  mapview(duck_creek_watershed,
-#          col.regions = pal$darkblue,
-#          layer.name = "Duck Creek") +
-mapview(park_boundary, alpha.regions = 0, lwd = 4, layer.name = "CEBR", col.regions = "black") +
-  mapview(source_table_locs,
-          col.regions = "black",
-          layer.name = "Blowhard Spring") + 
-  mapview(all_watersheds, col.regions = "pink")
-
-
-
-
-# Download data from reference stream sites
-nwis_select_discharge <- 
-  dataRetrieval::readNWISdv(siteNumbers = nwis_select_stream_gage$site_no,
-                                                   parameterCd = '00060') %>% # IF WE ALSO WANT HEIGHT == '00065'
-  data.table() %>%
-  dplyr::rename("discharge" = "X_00060_00003",
-                "date" = "Date") %>%
-  #dplyr::filter(year(date) >= 1940) %>%
-  dplyr::group_by(site_no) %>%
-  dplyr::left_join(st_drop_geometry(nwis_select_watershed), by = "site_no") %>%
-  dplyr::mutate(discharge_in_nwis = 86400 * 12 * discharge / (drain_sqkm * 1.076e+7))
-
-
+# --- 5. Annual Summaries ---
 nwis_select_discharge_an <- nwis_select_discharge %>%
-  dplyr::mutate(y = year(date)) %>%
-  dplyr::group_by(y, site_no) %>%
-  dplyr::summarize(mean_discharge = mean(discharge, na.rm = TRUE),
-                   mean_discharge_in_nwis = mean(discharge_in_nwis, na.rm = TRUE),
-                   peak_discharge = max(discharge, na.rm = TRUE),
-                   .groups = "keep")
+  mutate(year = year(date)) %>%
+  group_by(year, site_no) %>%
+  summarize(
+    mean_q      = mean(discharge, na.rm = TRUE),
+    mean_q_unit = mean(discharge_in_nwis, na.rm = TRUE),
+    peak_q      = max(discharge, na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+# --- 6. Visualization ---
+mapview(mammoth_creek_watershed, col.regions = pal$lightblue, layer.name = "Mammoth Creek") +
+  mapview(coal_creek_watershed, col.regions = pal$orange, layer.name = "Coal Creek") +
+  mapview(park_boundary, alpha.regions = 0, lwd = 4, color = "black", layer.name = "CEBR") +
+  mapview(source_table_locs, col.regions = "black", layer.name = "Supply Locations")
+
 
 
 ```
@@ -567,46 +566,67 @@ We also look at NWIS groundwater sites near the park
 
 ```{r nwis_gw}
 
+# --- 1. Filter Groundwater Sites ---
 nwis_groundwater <- nwis %>%
-  dplyr::filter(data_type_cd == "gw",
-                n_obs >= 1) %>%
+  filter(data_type_cd == "gw", n_obs >= 1) %>%
   add_gw_meta()
 
-mapview(nwis_groundwater)
-
-# There are no groundwater sites right near the park, but several are located below the breaks northwest of Cedar City and to the East on the Markagunt Plateau at lower elevation. To further investigate groundwater levels in the Claron, we now filter to just include wells in the claron (formerly called the Wasatch and labeled in this database as such).
-
-# Pull gw levels in the claron
+# Filter specifically for the Claron (labeled as Wasatch Formation)
 nwis_claron <- nwis_groundwater %>%
-  dplyr::filter(`Local Aquifer Name` == "Wasatch Formation")
+  filter(aquifer_name == "Wasatch Formation")
 
-mapview(nwis_claron) +
-  mapview(park_boundary, alpha.region = 0, color = "black", lwd = 3)
+# Quick spatial check
+mapview(nwis_claron, layer.name = "Claron Wells") +
+  mapview(park_boundary, alpha.region = 0, color = "black", lwd = 3, layer.name = "CEBR")
 
-# pull those sites groundwater level data and convert to monthly mean
-nwis_groundwater_levels <- dataRetrieval::readNWISgwl(nwis_claron$site_no) %>%
-  data.table::data.table() %>%
-  dplyr::filter(parameter_cd %in% c(62611, 72019),
-                year(as.Date(lev_dt)) >= 1900) %>% # 72019 = depth, 62611 = elevation
-  dplyr::mutate(ym = lubridate::ym(substr(lev_dt, 1, 7))) %>% 
-  dplyr::group_by(ym, site_no, parameter_cd) %>%
-  dplyr::summarize(mean_lev = mean(sl_lev_va, na.rm. = TRUE), # elevation
-                   mean_depth = mean(lev_va, na.rm. = TRUE), # depths
-                   .groups = "keep") %>%
-  dplyr::select(ym, site_no, mean_lev, mean_depth) %>%
-  dplyr::group_by(site_no) %>%
-  dplyr::mutate(dev_mean = mean_lev - mean(mean_lev, na.rm = TRUE))
-#tidyr::pivot_wider(names_from = site_no, names_prefix = "well_", 
-#values_from = mean_lev_va) #%>%
-ggplotly(
-ggplot(nwis_groundwater_levels,# %>% dplyr::filter(site_no == 372744113133501), 
-       aes(x = ym, y = mean_lev, col = site_no)) + geom_point() + 
-  geom_line() +
-  labs(x = "", y = "Groundwater Elevation in Claron Wells (ft)") +
-  geom_hline(yintercept = 10318.64, linetype = "dashed") +
-  annotate("text", x = min(nwis_groundwater_levels$ym) + years(1), y = 10150, label = "Blowhard Spring Elevation") +
+# --- 2. Retrieve and Process Water Levels ---
+nwis_groundwater_levels <- readNWISgwl(nwis_claron$site_no) %>%
+  filter(
+    parameter_cd %in% c(62611, 72019),
+    year(as.Date(lev_dt)) >= 1900
+  ) %>% 
+  mutate(
+    # Use floor_date for cleaner monthly grouping
+    ym = floor_date(as.Date(lev_dt), "month")
+  ) %>%
+  group_by(ym, site_no, parameter_cd) %>%
+  summarize(
+    mean_lev   = mean(sl_lev_va, na.rm = TRUE), # Elevation
+    mean_depth = mean(lev_va, na.rm = TRUE),    # Depth
+    .groups    = "drop"
+  ) %>%
+  group_by(site_no) %>%
+  mutate(
+    # Calculate anomaly (deviation from well's long-term mean)
+    dev_mean = mean_lev - mean(mean_lev, na.rm = TRUE)
+  ) %>% 
+  ungroup()
+
+# --- 3. Visualization ---
+# Define reference elevation for Blowhard Spring
+spring_elev <- 10318.64
+
+gw_plot <- ggplot(nwis_groundwater_levels, aes(x = ym, y = mean_lev, color = site_no)) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = spring_elev, linetype = "dashed", color = "darkred") +
+  annotate(
+    "text", 
+    x = min(nwis_groundwater_levels$ym), 
+    y = spring_elev + 50, 
+    label = "Blowhard Spring Elevation",
+    hjust = 0
+  ) +
+  labs(
+    title = "Groundwater Elevation in Claron Wells",
+    x = "Year",
+    y = "Elevation (ft)",
+    color = "Site Number"
+  ) +
   theme_bw()
-)
+
+ggplotly(gw_plot)
+
 
 ```
 
@@ -743,7 +763,7 @@ mapview(recharge_area, col.regions = "dodgerblue", layer.name = "Recharge Area")
 
 
 # Plot high recharge elevation as raster - takes a min
-#my_colors <- colorRampPalette(c("lightblue","darkblue"))(100)
+my_colors <- colorRampPalette(c("lightblue","darkblue"))(100)
 
 #mapview(thresh_elev, 
 #        col.regions = my_colors, 
@@ -773,6 +793,8 @@ sinkhole_1m <- read_sf("data/park/CEBR/CEBR_sinkholes/CEBR_1m_100m.shp")
 
 sinkhole_1m_centroids <- sinkhole_1m %>% st_centroid()
 
+my_colors <- colorRampPalette(c("lightblue","darkblue"))(100)
+
 mapview(thresh_elev, 
         col.regions = my_colors, 
         layer.name = "Elevation > 3145 m",
@@ -785,13 +807,6 @@ mapview(sinkhole_5m, col.regions = "orange", layer.name = "5m sinkhole") +
   mapview(source_table_locs,
           layer.name = "Blowhard Spring") +
   mapview(springs[,1:2])
-
-
-b + mapview(sinkhole_1m %>% st_centroid(), 
-            col.regions = "darkblue", 
-            cex = 3,
-            layer.name = "Sinkholes") +
- mapview(thresh_poly, col.regions = "lightblue")
 
 ```
 
@@ -946,8 +961,12 @@ recharge_aoi <- recharge_area #%>% st_buffer(4000)
 
 #saveRDS(clim_hist, "data/park/CEBR/Climate_Data/clim_hist.rds")
 #saveRDS(aoi_gridmet_grid, "data/park/CEBR/Climate_Data/aoi_gridmet_grid.rds")
-clim_hist <- readRDS("data/park/CEBR/Climate_Data/clim_hist.rds") 
-aoi_gridmet_grid <- readRDS("data/park/CEBR/Climate_Data/aoi_gridmet_grid.rds")
+clim_hist <- readRDS("data/park/CEBR/Climate_Data/clim_hist.rds") %>%
+  dplyr::filter(GCM == "GridMET",
+                year(date) < 2025,
+                year(date) > 1979)
+
+aoi_gridmet_grid <- readRDS("data/park/CEBR/Climate_Data/aoi_gridmet_grid.rds") 
 
 # Extract unique grid center points for each climate dataset
 clim_pts <- clim_hist %>% 
@@ -970,13 +989,13 @@ clim_pts <- clim_hist %>%
 #  dplyr::left_join(all_cfs %>% dplyr::select(-"RCP"), by = "GCM") %>%
 #  dplyr::select(-c("Ensemble","RCP")) 
 #saveRDS(clim_fut, "data/park/CEBR/Climate_Data/clim_fut.rds")
-clim_fut <- readRDS("data/park/CEBR/Climate_Data/clim_fut.rds") 
-
+clim_fut <- readRDS("data/park/CEBR/Climate_Data/clim_fut.rds") %>%
+  dplyr::filter(year(date) > 2024)
 
 # Plot
 mapview(aoi_gridmet_grid, color = "red", alpha.regions = 0, lwd = 4) +
 mapview(recharge_aoi) +
-mapview(clim_fut_pts, col.regions = pal$yellow, cex = 6) +
+#mapview(clim_fut_pts, col.regions = pal$yellow, cex = 6) +
 mapview(clim_pts, col.regions = "red", cex = 3)
 
 
@@ -991,41 +1010,41 @@ For our report, we ran the NPS water balance model (WBM) for each GridMET point 
 ```{r wbm_run}
 
 hist_wbm <- run_NPS_WBM_points(points = clim_pts,
-                                         climate_data = clim_hist,
-                                         Direct_Frac = 0, # CSU ADDITION
-                                         Return_Rate = 1, # CSU ADDITION
-                                         PET_Method = "Oudin",
-                                         hock_coef = 2,
-                                         Snowpack.Init = 0, 
-                                         Soil.Init = 0,
-                                         Shade.Coeff = 1,
-                                         T.Base = 0,
-                                         Soil_mult = 1,
-                                         PET_mult = 1,
-                                         area_weighted = TRUE, 
-                                         aoi = recharge_aoi, 
-                                         grid = aoi_gridmet_grid,
-                                         ret_final_cond = TRUE,
-                                         use_final = FALSE) 
+                               climate_data = clim_hist,
+                               Direct_Frac = 0, # CSU ADDITION
+                               Return_Rate = 1, # CSU ADDITION
+                               PET_Method = "Oudin",
+                               hock_coef = 2,
+                               Snowpack.Init = 0, 
+                               Soil.Init = 0,
+                               Shade.Coeff = 1,
+                               T.Base = 0,
+                               Soil_mult = 1,
+                               PET_mult = 1,
+                               area_weighted = TRUE, 
+                               aoi = recharge_aoi, 
+                               grid = aoi_gridmet_grid,
+                               ret_final_cond = TRUE,
+                               use_final = FALSE) 
 
 fut_wbm <- run_NPS_WBM_points(points = clim_pts,
-                                     climate_data = clim_fut,
-                                     Direct_Frac = 0, # CSU ADDITION
-                                     Return_Rate = 1, # CSU ADDITION
-                                     PET_Method = "Oudin",
-                                     hock_coef = 2,
-                                     Snowpack.Init = 0, 
-                                     Soil.Init = 0,
-                                     Shade.Coeff = 1,
-                                     T.Base = 0,
-                                     Soil_mult = 1,
-                                     PET_mult = 1,
-                                     area_weighted = TRUE, 
-                                     aoi = recharge_aoi, 
-                                     grid = aoi_gridmet_grid,
-                                     ret_final_cond = FALSE,
-                                     use_final = TRUE,
-                                     param_list = hist_wbm[[2]]) 
+                             climate_data = clim_fut,
+                             Direct_Frac = 0, # CSU ADDITION
+                             Return_Rate = 1, # CSU ADDITION
+                             PET_Method = "Oudin",
+                             hock_coef = 2,
+                             Snowpack.Init = 0, 
+                             Soil.Init = 0,
+                             Shade.Coeff = 1,
+                             T.Base = 0,
+                             Soil_mult = 1,
+                             PET_mult = 1,
+                             area_weighted = TRUE, 
+                             aoi = recharge_aoi, 
+                             grid = aoi_gridmet_grid,
+                             ret_final_cond = FALSE,
+                             use_final = TRUE,
+                             param_list = hist_wbm[[2]]) 
 
 
 
@@ -1055,9 +1074,10 @@ all_clim_stats <- wbm_all %>%
   data.table() %>%
   dplyr::mutate(year = year(date),
                 stat_period = 
-                  ifelse(year < 2013, "Baseline",
+                  ifelse(year < 2013 & year > 1979, "Baseline",
                       ifelse(year > 2034 & year < 2065, "Future", "Other"))) %>%
-  dplyr::filter(!stat_period == "Other") %>%
+  dplyr::filter(!stat_period == "Other",
+                stat_period != "Baseline" | GCM == "GridMET") %>%
   dplyr::select(GCM, stat_period, Skill, precip_in_wbm, tmean_C, runoff_in_wbm, pet_in_wbm, aet_in_wbm) %>%
   dplyr::group_by(GCM, stat_period, Skill) %>%
   dplyr::summarize(mean_precip_in = mean(precip_in_wbm) * 365.25,
@@ -1131,7 +1151,7 @@ selected_cfs <- selected_gcms[[1]] %>%
   data.table() %>%
   dplyr::mutate(CF = ifelse(CF == "Hot Wet", "Wetter", "Drier"))
 
-ggsave(selected_gcms[[2]], filename = "docs/Deep Dives/CEBR/Figs/Climate_Selection.tiff", width = 9, height = 7,  dpi = 600)
+ggsave(selected_gcms[[2]], filename = "data/park/CEBR/Figs/Climate_Selection.tiff", width = 9, height = 7,  dpi = 600)
 
 
 ```
@@ -1164,6 +1184,8 @@ setorder(wbm, date)
 mod_dat <- wbm %>% dplyr::filter(year(date) < 1985) %>%
   dplyr::select(date, runoff_gpm) %>% ungroup() 
 
+# Run routing model for average flow - manually calibrate (adjust parameters
+# to achieve best fit (by checking NSE and Bias below))
 springflow <-  runoff_routing_gw(df = mod_dat, 
                                  runoff_col = "runoff_gpm",
                                  date_col = "date",
@@ -1178,18 +1200,59 @@ springflow <-  runoff_routing_gw(df = mod_dat,
                                  max_inf = 5000) %>%
   dplyr::left_join(blowhard_spr, by = "date")
 
+# Also adjust model to capture lower plausible runoff estimate by adjusting scale factor (0.5 * 0.015 earlier) and vs parameter.
+springflow_min <-  runoff_routing_gw(df = mod_dat %>% dplyr::mutate(runoff_gpm = 0.5 * runoff_gpm), 
+                                 runoff_col = "runoff_gpm",
+                                 date_col = "date",
+                                 tau_q = 24, 
+                                 tau_s = 68, 
+                                 vs = .2,
+                                 loss = 0,
+                                 baseflow = 0,
+                                 delay = 0,
+                                 slow_only = TRUE,
+                                 return_components = TRUE,
+                                 max_inf = 5000) %>%
+  dplyr::left_join(blowhard_spr, by = "date")
+
+# Do the same for a plausible higher flow
+springflow_max <-  runoff_routing_gw(df = mod_dat %>% dplyr::mutate(runoff_gpm = 1.5 * runoff_gpm), 
+                                 runoff_col = "runoff_gpm",
+                                 date_col = "date",
+                                 tau_q = 24, 
+                                 tau_s = 68, 
+                                 vs = .5,
+                                 loss = 0,
+                                 baseflow = 0,
+                                 delay = 0,
+                                 slow_only = TRUE,
+                                 return_components = TRUE,
+                                 max_inf = 5000) %>%
+  dplyr::left_join(blowhard_spr, by = "date")
+
+springflow_plot <- springflow %>%
+  dplyr::mutate(Q_tot_min = springflow_min$Q_tot,
+                Q_tot_max = springflow_max$Q_tot) %>%
+  dplyr::group_by(year(date)) %>%
+  dplyr::mutate(annual_mean_Q_tot = mean(Q_tot, na.rm = TRUE))
+
 # Plot of modeled springflow and runoff
-ggplot(springflow, aes(x = date)) +
+ggplot(springflow_plot, aes(x = date)) +
   geom_rect(aes(xmin = as.Date("1983-01-01"), xmax = as.Date("1984-01-01"), ymin = -Inf, ymax = Inf),
             fill = "grey85", linewidth = 0,  alpha = .1) + 
-  
+  geom_ribbon(aes(x = date, ymin = Q_tot_min, ymax = Q_tot_max), fill = pal$lightblue, alpha = 0.5, linewidth = 1.5, lineend = "round") + 
   geom_line(aes(x = date, y = Q_tot), color = "black", linewidth = 1.5, lineend = "round") + 
   geom_line(aes(x = date, y = Q_tot, color = "Modeled"), linewidth = 1, lineend = "round") + 
+  
   geom_point(aes(y = flow_gpm, color = "Observed"), size = 2, shape = 21, fill = pal$darkblue) +
+  # geom_line(aes(x = date, y = annual_mean_Q_tot), color = "black", linewidth = 1, lineend = "round", linetype = "dotted") + 
+  
   theme_bw() +
   labs(x = "", y = "Flow (gpm)") +
   scale_color_manual("", values = c(pal$lightblue, "black", pal$lightblue))
 
+
+# Remove bad year 1983 which is identical to 1982 and error
 rm_bd_yrs <- springflow %>% 
   dplyr::filter(!year(date) %in% c(1983)) %>% 
   drop_na(flow_gpm, Q_tot) %>% dplyr::select(flow_gpm, Q_tot)
@@ -1215,8 +1278,11 @@ wbm <- wbm %>%
   dplyr::ungroup() %>%
     data.table() %>%
   dplyr::group_by(GCM) %>%
+  # apply updated runoff scale factors (0.5/1.5 * previously applied 0.015)
+  dplyr::mutate(runoff_gpm_low = 0.5 * runoff_gpm,
+                runoff_gpm_high = 1.5 * runoff_gpm) %>%
   dplyr::mutate(discharge_gpm = runoff_routing_gw(
-                                    df = data.table(date,runoff_gpm),  # The .SD is the subset for the current group
+                                    df = data.table(date,runoff_gpm), 
                                     runoff_col = "runoff_gpm",
                                     date_col = "date",
                                     tau_q = 24,
@@ -1228,12 +1294,43 @@ wbm <- wbm %>%
                                     slow_only = TRUE,
                                     return_components = FALSE,
                                     max_inf = 5000
+                                  )[,2],
+                discharge_gpm_low = runoff_routing_gw(
+                                    df = data.table(date,runoff_gpm_low),  # The .SD is the subset for the current group
+                                    runoff_col = "runoff_gpm_low",
+                                    date_col = "date",
+                                    tau_q = 24,
+                                    tau_s = 68,
+                                    vs = .2,
+                                    loss = 0,
+                                    baseflow = 0,
+                                    delay = 0,
+                                    slow_only = TRUE,
+                                    return_components = FALSE,
+                                    max_inf = 5000
+                                  )[,2],
+                discharge_gpm_high = runoff_routing_gw(
+                                    df = data.table(date,runoff_gpm_high),  # The .SD is the subset for the current group
+                                    runoff_col = "runoff_gpm_high",
+                                    date_col = "date",
+                                    tau_q = 24,
+                                    tau_s = 68,
+                                    vs = .5,
+                                    loss = 0,
+                                    baseflow = 0,
+                                    delay = 0,
+                                    slow_only = TRUE,
+                                    return_components = FALSE,
+                                    max_inf = 5000
                                   )[,2]) %>%
-  dplyr::mutate(discharge_cf = discharge_gpm * 0.133681 * 60 * 24)
+  dplyr::mutate(discharge_cf = discharge_gpm * 0.133681 * 60 * 24,
+                discharge_cf_low = discharge_gpm_low * 0.133681 * 60 * 24,
+                discharge_cf_high = discharge_gpm_high * 0.133681 * 60 * 24)
 
 #ggplotly(ggplot(wbm, aes(x = date, y = discharge_gpm, color = CF)) + geom_line())
 
-mean_cols <- c("soil_in_wbm", "tmean_C", "runoff_cfs_wbm", "tmean_F", "discharge_gpm")
+mean_cols <- c("soil_in_wbm", "tmean_C", "runoff_cfs_wbm", "tmean_F", 
+               "discharge_gpm", "discharge_gpm_low", "discharge_gpm_high")
 
 wbm_annual <- wbm %>%
   dplyr::mutate(year = calc_water_year(date)) %>%
@@ -1258,6 +1355,9 @@ wbm_monthly <- wbm %>%
     across(everything(), \(x) sum(x, na.rm = TRUE))
   )
 
+rm(wbm_all)
+gc()
+
 ```
 
 #####- Visitation
@@ -1266,11 +1366,12 @@ Here we pull in park visitation data reported by the NPS and located in NPS IRMA
 
 ```{r}
 
-
 # Load in historical visitation data
 
 # Get historical monthly reported visitor information
-visitors <- getUnitVisitation(units = park, startYear = 1979, endYear = 2024) %>%
+visitors <- getUnitVisitation(units = park, 
+                              startYear = 1979, 
+                              endYear = 2024) %>%
   dplyr::mutate(ym = lubridate::ym(paste0(Year, "-", Month))) %>%
   dplyr::mutate(TotalVisitors = RecreationVisitors + NonRecreationVisitors) %>%
   dplyr::select(ym, TotalVisitors) %>%
@@ -1295,65 +1396,388 @@ monthly_visitor_proportions <- visitors %>%
            dplyr::mutate(month_date = as_date(paste0("2000-",month,"-01")),
                          fraction = TV_mean/sum(TV_mean))
 
+# Plot visitors to look at trends
+ggarrange(
+  ggplot(visitors_an, aes(x = year, y = TotalVisitors)) +
+    geom_line() +
+    geom_point() +
+    geom_smooth() +
+    labs(y = "Annual Total Visitors") +
+    theme_bw(),
+  ggplot(monthly_visitor_proportions, aes(x = month, y = TV_mean)) +
+    geom_line() +
+    geom_point() +
+    labs(y = "Monthly Mean Total Visitors") +
+    theme_bw())
+
+```
+
+Now, we'll develop a model to estimate future visitation. We'll develop a couple of models and select the one that performs best. National Park visitation has a complex set of drivers, many which we are beyond our ability to forecast. Here, we account for two major drivers of visitation: overall population increase and weather. 
+
+For this first part, we develop a logistic model simply to account for visitor growth at the park. We assume some visitor carrying capacity for CEBR. This is unknown and could change in the future. Given recent population growth variability, we assume the carrying capcity is 1,200,000.
+
+```{r logistic}
+# 1. Define an estimated Carrying Capacity (K) for CEBR
+# We don't know what this value is, so we'll test a low, medium, and high value
+K_limit_low <- 800000
+K_limit_mid <- 1250000 
+K_limit_high <- 1500000
+
+logistic_mod <- function(K_limit, r, t0, year) {
+  K_limit / (1 + exp(-r * (year - t0)))
+}
+
+fit_vis_logistic <- function(K_limit, df) {
+  vis_mod_logistic <- nls(TotalVisitors ~ logistic_mod(K_limit, r, t0, year),#K_limit / (1 + exp(-r * (year - t0))),
+                        data = df,
+                        start = list(r = 0.05, t0 = 2010))
+}
 
 
-# Generalized Additive Model - better deals with correlation between year and temp
-vis_mod <- mgcv::gam(TotalVisitors ~ year + tmean, 
-               data = visitors_an %>%
-                      left_join(clim_hist %>% 
-                      dplyr::mutate(year = year(date), 
-                                    tmean = (tmean_C * 9/5) + 32) %>%
-                      dplyr::group_by(year) %>%
-                      dplyr::summarize(tmean = mean(tmean),
-                                       prcp = mean(ppt_mm)), by = "year"))
+# 2. Fit a Logistic Model using Non-linear Least Squares
+# This estimates 'r' (growth rate) and 't0' (the inflection point year)
+vis_logistic_low <- fit_vis_logistic(K_limit_low, visitors_an)
+vis_logistic_mid <- fit_vis_logistic(K_limit_mid, visitors_an)
+vis_logistic_high <- fit_vis_logistic(K_limit_high, visitors_an)
 
-# Extract Model Stats# Extract Model Statsprcomp()
-r_squared <- summary(vis_mod)$r.sq
-p_val <- summary(vis_mod)$p.pv %>% mean()
 
-# Format the equation and R-squared into a single string
-vis_r2_label <- paste0("R² = ", format(r_squared, digits = 3))
-vis_p_label <- paste0("p = ", format(p_val, digits = 3))
+# 3. Predict out to 2100
+future_years <- data.frame(year = 1980:2100) %>%
+  dplyr::mutate(
+    pred_vis_low = predict(vis_logistic_low, newdata = .),
+    pred_vis_mid = predict(vis_logistic_mid, newdata = .),
+    pred_vis_high = predict(vis_logistic_high, newdata = .))
+
+ggplot() +
+  geom_point(data = visitors_an, aes(x = year, y = TotalVisitors, color = "Obs.")) +
+  geom_ribbon(data = future_years, aes(x = year, ymin = pred_vis_low, ymax = pred_vis_high), alpha = 0.3) +
+  geom_line(data = future_years, aes(x = year, y = pred_vis_mid, color = "mod")) +
+  theme_bw() +
+  geom_hline(yintercept = 1200000, linetype = "dashed") +
+  labs(x = "", y = "Total Visitors", title = "Simple Logistic Model to enforce visitor ceiling") +
+  scale_color_manual("", values = c("black","red"))
+
+```
+
+Create monthly visitation model
+```{r monthly_vis_model}
+# Now develop a model to estimate future visitation
+
+# 1. Prepare Monthly Data (Don't summarize to Annual)
+vis_mod_dat_monthly <- visitors %>%
+  left_join(wbm_monthly %>% dplyr::filter(GCM == "GridMET"), by = "ym") %>%
+  dplyr::mutate(year = year(ym),
+                pop = logistic_mod(K_limit_mid, 
+                                   coef(vis_logistic_mid)["r"],
+                                   coef(vis_logistic_mid)["t0"],
+                                   year),
+                tmean_F_prev = dplyr::lag(tmean_F, 1),
+                tmean_F_prev2 = frollmean(tmean_F, 2, align = "right"),
+                )# %>%
+  #dplyr::filter(year > 2010)#dplyr::filter(year > 2010)#dplyr::filter(year > 2010)
+
+
+# 2. Fit a Monthly GAM
+# k=12 ensures it can capture the 12-month cycle
+vis_mod_monthly <- 
+  mgcv::gam(TotalVisitors ~ 
+              pop + 
+              tmean_F + 
+              tmean_F_prev +
+              snow_in_wbm, 
+              data = vis_mod_dat_monthly) # Use negative binomial if you have "overdispersed" counts
+
+# 3. Run GAM on historical data to add to vis_dataframe
+vis_mod_dat_monthly <- vis_mod_dat_monthly %>%
+  dplyr::mutate(pred_vis = predict(vis_mod_monthly, newdata = .),
+                pred_vis = ifelse(pred_vis < 0, 0, pred_vis),
+                pred_vis_residual = TotalVisitors - pred_vis)
+
+# 4. Summarize to annual to see how well monthly model captures inter-annual variations
+vis_mod_dat_m_an <- vis_mod_dat_monthly %>%
+  dplyr::select(year, TotalVisitors, pred_vis) %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarize(TotalVisitors = sum(TotalVisitors, na.rm = TRUE),
+                   pred_vis = sum(pred_vis, na.rm = TRUE)) %>%
+  dplyr::mutate(pred_vis_residual = TotalVisitors - pred_vis) %>%
+  dplyr::filter(pred_vis != 0)
+
+# 5. Calculate some model performance stats
+
+# Monthly R2 of monthly model
+monthly_R2 <- round(summary(vis_mod_monthly)$r.sq,2)
+
+# Annual R2 of monthly model - bad
+annual_R2 <- round(summary(lm(pred_vis ~ TotalVisitors, data = vis_mod_dat_m_an))$r.sq,2) #annualR2
+
+# 6. Plot model performance
+# View monthly model performance
+ggarrange(
+  ggplot(vis_mod_dat_monthly) +
+    geom_line(aes(x = ym, 
+                  y = TotalVisitors, 
+                  color = "Observed"), lwd = .5) +
+    geom_line(aes(x = ym,
+                  y = pred_vis,
+                  color = "Modeled"), lwd = .5) +
+    theme_bw() + 
+    annotate("text", 
+             label = as.character(as.expression(bquote(R^2 == .(monthly_R2)))),
+             parse = TRUE,
+             x = -Inf, y = Inf, 
+             hjust = -0.1, vjust = 1.5, # Adjusts 'inward' from the top-left corner
+             size = 4, fontface = "italic") +
+    labs(x = "", y = "Monthly Visitors", title = "Monthly GAM") +
+    scale_color_manual("", values = c("tomato","black")),
+  ggplot(vis_mod_dat_m_an,
+         aes(x = year)) +
+    geom_line(aes(y = TotalVisitors, color = "Observed"), lwd = 1) +
+    geom_line(aes(y = pred_vis, color = "Modeled"), lwd = 1) +
+    theme_bw() +
+    annotate("text", 
+             label = as.character(as.expression(bquote(R^2 == .(annual_R2)))),
+             parse = TRUE,
+             x = -Inf, y = Inf, 
+             hjust = -0.1, vjust = 1.5, # Adjusts 'inward' from the top-left corner
+             size = 4, fontface = "italic") +
+    labs(title = "Aggregated Monthly GAM to Annual") +
+    scale_color_manual("", values = c("tomato", "black")),
+  ggplot(vis_mod_dat_monthly,
+         aes(x = ym, 
+             y = pred_vis_residual)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(y = "residual (# visitors)", x = "", title = "Residuals") +
+    geom_point(alpha = 0.5) +
+    geom_line() +
+    theme_bw(),
+  ggplot(vis_mod_dat_monthly,
+         aes(x = TotalVisitors,
+             y = pred_vis)) +
+    geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed", size = 1) +
+    geom_point(alpha = 0.5, size = 2) +
+    theme_bw() +
+    coord_equal() +
+    labs(x = "Observed Monthly Visitors", y = "Modeled Monthly Visitors", title = "1:1 Accuracy"), 
+  align = "hv")
+
+```
+
+Create annual visitation model
+
+```{r annual_vis_model}
+
+# 1. Finalize the annual data preparation
+vis_mod_dat <- visitors_an %>%
+  left_join(clim_hist %>% 
+              dplyr::mutate(year = year(date), 
+                            tmean_F = (tmean_C * 9/5) + 32) %>%
+              dplyr::group_by(year) %>%
+              dplyr::summarize(tmean_F = mean(tmean_F),
+                               prcp = mean(ppt_mm)), by = "year") %>%
+  dplyr::arrange(year) %>%
+  dplyr::mutate(pop = logistic_mod(K_limit_mid, 
+                                   coef(vis_logistic_mid)["r"],
+                                   coef(vis_logistic_mid)["t0"],
+                                   year),
+                tmean_F_prev = dplyr::lag(tmean_F, 1),)
+
+# 2. Fit the Annual GAM
+vis_mod <- mgcv::gam(TotalVisitors ~ 
+                       year + 
+                       tmean_F +
+                       pop, 
+                     data = vis_mod_dat)
+
+# 3. Generate Predictions and Residuals
+vis_mod_dat <- vis_mod_dat %>%
+  dplyr::mutate(pred_vis = predict(vis_mod, newdata = .),
+                # Ensure no negative visitors
+                pred_vis = ifelse(pred_vis < 0, 0, pred_vis),
+                pred_vis_residual = TotalVisitors - pred_vis)
+
+# 4. Extract Model Performance Stats
+r2_val <- round(summary(vis_mod)$r.sq, 2)
+p_val <- format.pval(mean(summary(vis_mod)$p.pv), digits = 2, eps = 0.001)
+
+
+# Create the multi-panel visualization
+annual_vis_mod_plot <- ggarrange(
+  # Panel A: Time Series (Observed vs Modeled)
+  ggplot(vis_mod_dat) +
+    geom_line(aes(x = year, y = TotalVisitors, color = "Observed"), size = 1) +
+    geom_line(aes(x = year, y = pred_vis, color = "Modeled"), size = 1) +
+    theme_bw() + 
+    annotate("text", 
+             label = as.character(as.expression(bquote(R^2 == .(r2_val) ~~~ p < .(p_val)))),
+             parse = TRUE,
+             x = -Inf, y = Inf, 
+             hjust = -0.1, vjust = 1.5,
+             size = 4, fontface = "italic") +
+    labs(x = "Year", y = "Annual Visitors", title = "Annual Model Performance") +
+    scale_color_manual("", values = c("Modeled" = "tomato", "Observed" = "black")),
+
+  # Panel B: Residuals over Time
+  ggplot(vis_mod_dat, aes(x = year, y = pred_vis_residual)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_line() +
+    geom_point() +
+    labs(y = "Residual (# visitors)", x = "Year", title = "Annual Residuals") +
+    theme_bw(),
+
+  # Panel C: Observed vs Modeled (1:1 Plot)
+  ggplot(vis_mod_dat, aes(x = TotalVisitors, y = pred_vis)) +
+    geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dotted", size = 1) +
+    geom_point(alpha = 0.7, size = 2) +
+    theme_bw() +
+    coord_equal() + # Important for 1:1 plots
+    labs(x = "Observed Annual Visitors", y = "Modeled Annual Visitors", title = "1:1 Accuracy"),
+
+  ncol = 1, # Stacked vertically to better see annual trends
+  align = "v"
+)
+
+
+ggsave(plot = annual_vis_mod_plot, filename = "data/park/CEBR/Figs/Annual_vis_mod.tiff", dpi = 600, width = 7, height = 5)
+```
+
+Now compare performance of the annual and monthly aggregated model
+
+```{r compare_models}
+
+# 1. Combine both annual predictions into one comparison dataframe
+comparison_df <- vis_mod_dat_m_an %>%
+  dplyr::rename(pred_monthly_agg = pred_vis) %>%
+  dplyr::left_join(vis_mod_dat %>% dplyr::select(year, pred_annual = pred_vis), by = "year")
+
+# 2. Function to calculate error metrics
+get_metrics <- function(obs, pred) {
+  rmse <- sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  mae <- mean(abs(obs - pred), na.rm = TRUE)
+  return(c(RMSE = rmse, MAE = mae))
+}
+
+# 3. Create the Comparison Table
+model_comparison <- data.frame(
+  Metric = c("RMSE (Visitors)", "MAE (Visitors)"),
+  Monthly_Aggregated = get_metrics(comparison_df$TotalVisitors, comparison_df$pred_monthly_agg),
+  Annual_Direct = get_metrics(comparison_df$TotalVisitors, comparison_df$pred_annual)
+)
+
+print(model_comparison)
+
+# Plot
+ggplot(comparison_df) +
+  geom_line(aes(x = year, y = TotalVisitors, color = "Observed"), size = 1.2) +
+  geom_line(aes(x = year, y = pred_monthly_agg, color = "Monthly-Aggregated"), linetype = "dashed") +
+  geom_line(aes(x = year, y = pred_annual, color = "Annual-Direct"), linetype = "dotted") +
+  scale_color_manual("", values = c("Observed" = "black", 
+                                    "Monthly-Aggregated" = "tomato", 
+                                    "Annual-Direct" = "dodgerblue")) +
+  labs(title = "Model Comparison: Aggregated Monthly vs. Direct Annual",
+       subtitle = "Which model better captures historical extremes?",
+       y = "Total Annual Visitors", x = "Year") +
+  theme_bw()
+
+```
+
+The comparison indicates that the annual model performs better for annual estimates, so we'll use that moving forward.
+
+```{r proj_vis}
 
 # Prep future climate dataset and use model to project future visitation
-vis_clim <- clim_fut %>%
-  dplyr::ungroup() %>%
-  dplyr::filter(GCM %in% selected_cfs$GCM) %>%
-  dplyr::select(date, "tmean" = tmean_C) %>%
-  dplyr::mutate(year = year(date),
-                tmean = (tmean * 9/5) + 32 ) %>%
+vis_clim <- wbm_annual %>%
+  ungroup() %>%
+  dplyr::mutate(pop = logistic_mod(K_limit_mid, 
+                                   coef(vis_logistic_mid)["r"],
+                                   coef(vis_logistic_mid)["t0"],
+                                   year)) %>%
+  dplyr::select(year, pop, tmean_F, GCM, CF) %>%
+  dplyr::group_by(GCM, CF) %>%
+  dplyr::group_modify(~ {
+    preds <- predict(vis_mod, newdata = .x, se.fit = TRUE)
+    .x %>% mutate(vis_pred = as.numeric(preds$fit), 
+                  vis_pred_SE = as.numeric(preds$se.fit))
+  }) %>%
+  #group_by(GCM, CF) %>%
+  dplyr::mutate(vis_pred_low = vis_pred - (vis_pred_SE * 1.96),
+                vis_pred_high = vis_pred + (vis_pred_SE * 1.96)) %>%
+  ungroup() %>%
   dplyr::group_by(year) %>%
-  dplyr::summarize(tmean = mean(tmean)) %>%
-  bind_rows(vis_mod_dat %>% dplyr::select(year, tmean)) %>%
-  dplyr::mutate(vis_pred = predict(vis_mod, newdata = ., se.fit = TRUE)$fit,
-                vis_pred_SE = predict(vis_mod, newdata = ., se.fit = TRUE)$se.fit,
-                vis_pred_low = vis_pred - (vis_pred_SE * 1.96),
-                vis_pred_high = vis_pred + (vis_pred_SE * 1.96))
+  mutate(vis_yearly_max = max(vis_pred_high),
+          vis_yearly_min = min(vis_pred_low),
+          vis_yearly_mean = mean(c(vis_pred_high,vis_pred_low), na.rm = TRUE))
+
+# View GAM model with predictions. Note, jagged bounds.
+ggplot(vis_clim, aes(x = year, fill = CF, color = CF)) +
+  geom_point(aes(y = vis_pred)) +
+  geom_ribbon(aes(ymin = vis_pred_low, ymax = vis_pred_high), alpha = 0.3, lwd = 0) +
+  geom_point(data = visitors_an %>%
+               dplyr::mutate(CF = "Observed"),
+             aes(x = year, y = TotalVisitors)) +
+  theme_bw() +
+  labs(x = "", y = "Annual Visitors") +
+  scale_color_manual("", 
+                       values = c(nps_pal$red, nps_pal$grey, "black", nps_pal$blue)) +
+  scale_fill_manual("", values = c(nps_pal$red, nps_pal$grey, "black", nps_pal$blue))
 
 # Because the GAM model predicts year-to-year estimates that vary with temp,
-# we then calculate a linear model from the predictions for plots
-lin_mod_proj <- lm(vis_pred ~ year, data = vis_clim)
-lin_mod_high <- lm(vis_pred_high ~ year, data = vis_clim)
-lin_mod_low <- lm(vis_pred_low ~ year, data = vis_clim)
+# we then calculate a smooth model from the predictions for plots.
+# Re-fit like above butfind the best r and t0 for these specific bounds
+# Note: We keep K_limit fixed based on your previous 'mid' assumption
+fit_smooth_logistic <- function(y_var, df, K) {
+  nls(y_var ~ logistic_mod(K, r, t0, year), 
+      data = df, 
+      start = list(r = 0.05, t0 = 2050))
+}
 
+# Apply the fits
+# (Using the mid K_limit you defined earlier)
+log_mod_proj <- fit_smooth_logistic(vis_clim$vis_yearly_mean, vis_clim, max(vis_clim$vis_yearly_mean))
+log_mod_high <- fit_smooth_logistic(vis_clim$vis_yearly_max, vis_clim, max(vis_clim$vis_yearly_max))
+log_mod_low  <- fit_smooth_logistic(vis_clim$vis_yearly_min, vis_clim, max(vis_clim$vis_yearly_min))
+
+# 3. Add the smooth lines back to the dataframe for plotting
 vis_clim <- vis_clim %>%
-  dplyr::mutate(vis_pred_lin = predict(lin_mod_proj, newdata = .),
-                low_smooth = predict(lin_mod_low, newdata = .),
-                high_smooth = predict(lin_mod_high, newdata = .)) %>%
-  # Also bind historical visitation
+  ungroup() %>% # Ensure no groups are interfering
+  mutate(
+    # predict() here will now correctly return 197 values for the 197 rows
+    vis_smooth_mid  = as.numeric(predict(log_mod_proj, newdata = .)),
+    vis_smooth_high = as.numeric(predict(log_mod_high, newdata = .)),
+    vis_smooth_low  = as.numeric(predict(log_mod_low, newdata = .))
+  ) %>%
   left_join(visitors_an %>% dplyr::select(year, TotalVisitors), by = "year")
+
+# Now view smooth plot
+ggplot(vis_clim, aes(x = year, fill = CF, color = CF)) +
+   geom_point(aes(y = vis_pred)) +
+  geom_ribbon(aes(ymin = vis_pred_low, ymax = vis_pred_high), alpha = 0.3, lwd = 0) +
+  geom_point(data = visitors_an %>%
+               dplyr::mutate(CF = "Observed"),
+             aes(x = year, y = TotalVisitors)) +
+  geom_point(aes(y = vis_smooth_mid)) +
+  geom_ribbon(aes(ymin = vis_smooth_low, ymax = vis_smooth_high), alpha = 0, linetype = "dashed") +
+  geom_point(data = visitors_an %>%
+               dplyr::mutate(CF = "Observed"),
+             aes(x = year, y = TotalVisitors)) +
+  theme_bw() +
+  labs(x = "", y = "Annual Visitors") +
+  scale_color_manual("", 
+                       values = c(nps_pal$red, nps_pal$grey, "black", nps_pal$blue)) +
+  scale_fill_manual("", values = c(nps_pal$red, nps_pal$grey, "black", nps_pal$blue))
 
 # Monthly vis
 proj_vis_sum <- vis_clim %>%
+  ungroup() %>%
   dplyr::filter(year > 2034, year < 2065) %>%
-  dplyr::summarize(mean_vis = mean(vis_pred_lin),
-                   max_vis = max(high_smooth),
-                   min_vis = min(low_smooth)) 
+  dplyr::summarize(mean_vis = mean(vis_smooth_mid),
+                   max_vis = max(vis_smooth_high),
+                   min_vis = min(vis_smooth_low)) 
 
+# Monthly visitor proportions - projections 
 monthly_visitor_proportions <- monthly_visitor_proportions %>%
-  dplyr::mutate(fut_min = proj_vis_sum$min_vis * fraction,
-                fut_max = proj_vis_sum$max_vis * fraction,
-                fut_mean = proj_vis_sum$mean_vis * fraction)
+  dplyr::mutate(fut_min_vis = proj_vis_sum$min_vis * fraction,
+                fut_max_vis = proj_vis_sum$max_vis * fraction,
+                fut_mean_vis = proj_vis_sum$mean_vis * fraction)
 
 
 ```
@@ -1363,6 +1787,7 @@ monthly_visitor_proportions <- monthly_visitor_proportions %>%
 Public water suppliers are required to report useage to the state. However, there are no available records online for water use at Cedar Breaks. Code to pull this information in is left in the rmd, but commented out. Instead, we estimate water use based on visitation with low, mid, and high use per visitor estimates based on published values.
 
 ```{r}
+
 
 # NOTE - THERE IS NO VALID WRID - NO REPORTED USE FOR CEBR
 
@@ -1414,36 +1839,44 @@ Public water suppliers are required to report useage to the state. However, ther
 
 # Therefore, we'll estimate based on visitation
 
-high_use_per_visitor <- 0.67 # CF --> equal to 5 gallons [high range use]
-low_use_per_visitor <- 0.83828345 * 0.133681 # Past use rate (hughes, 1996) [low use]
-mid_use_per_visitor <- (high_use_per_visitor + low_use_per_visitor)/2 # [mid range use]
+high_use_per_visitor <- 2.5 * gal_to_cf # --> equal to 5 gallons [high range use]
+low_use_per_visitor <- 0.83828345 * gal_to_cf # Past use rate (hughes, 1996) [low use]
+mid_use_per_visitor <- (high_use_per_visitor + low_use_per_visitor)/2# # [mid range use]
 
-# Calculate monthly use ranges for each time period
+# Calculate monthly use proportions (NOTE THESE ARE IN CF)
 monthly_use_proportions <- monthly_visitor_proportions %>%
-  dplyr::select(month, month_date, TV_mean, fut_mean) %>%
+  dplyr::select(month, month_date, TV_mean, fut_mean_vis) %>%
   dplyr::mutate(mid_use_hist = TV_mean * mid_use_per_visitor,
-                mid_use_fut = fut_mean * mid_use_per_visitor,
+                mid_use_fut = fut_mean_vis * mid_use_per_visitor,
                 low_use_hist = TV_mean * low_use_per_visitor,
-                low_use_fut = fut_mean * low_use_per_visitor,
+                low_use_fut = fut_mean_vis * low_use_per_visitor,
                 high_use_hist = TV_mean * high_use_per_visitor,
-                high_use_fut = fut_mean * high_use_per_visitor,
+                high_use_fut = fut_mean_vis * high_use_per_visitor,
                 use_fraction = mid_use_hist / sum(mid_use_hist))
 
 # Calculate annual use
 annual_use <- vis_clim %>% 
-  dplyr::mutate(vis = ifelse(year < 2025, TotalVisitors, vis_pred_lin)) %>%
-  dplyr::select(year, tmean, vis) %>%
-  dplyr::mutate(mid_use = vis * mid_use_per_visitor,
-                low_use = vis * low_use_per_visitor,
-                high_use = vis * high_use_per_visitor) %>%
+  # If historic, use observed, if future, use projected
+  dplyr::mutate(mid_vis = ifelse(year < 2025, TotalVisitors, vis_smooth_mid),
+                low_vis = ifelse(year < 2025, TotalVisitors, vis_smooth_low),
+                high_vis = ifelse(year < 2025, TotalVisitors, vis_smooth_high)) %>%
+  dplyr::select(year, tmean_F, mid_vis, low_vis, high_vis) %>%
+  dplyr::mutate(mid_use = mid_vis * mid_use_per_visitor,
+                low_use = mid_vis * low_use_per_visitor,
+                high_use = mid_vis * high_use_per_visitor) %>%
   dplyr::mutate(c_group = ifelse(year <= 2024, "Historical", "Projected")) 
 
-# Calculate use by month
+# Multiply annual by monthly use proportions
 monthly_use <- annual_use %>%
-  dplyr::select(-tmean) %>%
+  #group_by(year, c_group) %>%
+  # First summarize because multiple temp proj = multiple use proj
+  #dplyr::summarize(mid_use = mean(mid_use, na.rm = TRUE),
+  #                 high_use = mean(high_use, na.rm = TRUE),
+  #                 low_use = mean(low_use, na.rm = TRUE)) %>%
+  #dplyr::select(-tmean_F) %>%
  full_join(data.frame(ym = seq.Date(from = as.Date("1979-01-01"), 
                                     to = as.Date("2100-12-01"), by = "month")) %>%
-             dplyr::mutate(year = year(ym)), by = "year") %>%
+                      dplyr::mutate(year = year(ym)), by = "year") %>%
   dplyr::mutate(month = month(ym)) %>%
   left_join(monthly_use_proportions %>%
               dplyr::select(month, use_fraction)) %>%
@@ -1451,8 +1884,7 @@ monthly_use <- annual_use %>%
                 monthly_use_high = use_fraction * high_use,
                 monthly_use_low = use_fraction * low_use) %>%
   dplyr::select(ym, monthly_use_low, monthly_use_high, monthly_use_mid) %>%
-  full_join(wbm_monthly %>% dplyr::select(ym, discharge_cf, CF), by = "ym")
-
+  full_join(wbm_monthly %>% dplyr::select(ym, discharge_cf, discharge_cf_low, discharge_cf_high, CF), by = "ym")
 
 
 use_2024_2050_2070 <- annual_use %>%
@@ -1465,80 +1897,104 @@ use_2024_2050_2070 <- annual_use %>%
 
 ```
 
-#####- Supply Calculate monthly supply
+#####- Supply Calculate monthly supply and demand
 
 ```{r}
-# Create table of monthly mean, max, min, sd, and cv of historical visitors
-# Note, monthly supply calculated as monthly discharge
+
+# --- 1. Calculate Monthly Supply Proportions ---
 monthly_supply_proportions <- wbm %>%
-  dplyr::select(CF, date, discharge_cf) %>%
-  dplyr::mutate(ym = make_ym(date)) %>%
-  dplyr::group_by(ym, CF, GCM) %>%
-  dplyr::summarize(discharge_cf = sum(discharge_cf, na.rm = TRUE)) %>%
-          dplyr::mutate(month = month(ym),
-                        year = year(ym),
-                        group = case_when(year <= 2012 ~ "Historical",
-                                  #year > 2012 & year < 2025 ~ "Recent Historical",
-                                  year > 2034 & year < 2070 ~ "Future",
-                                  TRUE ~ NA)) %>%
-                  drop_na(group) %>%
-           dplyr::group_by(month, CF) %>%
-           dplyr::summarize(monthly_supply_cf = mean(discharge_cf, na.rm = TRUE),
-                            monthly_supply_cf_max = max(discharge_cf, na.rm = TRUE),
-                            monthly_supply_cf_min = min(discharge_cf, na.rm = TRUE)) %>%
-           dplyr::mutate(month_date = as_date(paste0("2000-",month,"-01")),
-                         month_days = days_in_month(month_date)) %>%
-  dplyr::group_by(CF) %>%
-            dplyr::mutate(total_cf = sum(monthly_supply_cf),
-                         monthly_fraction = monthly_supply_cf/total_cf)
+  select(CF, date, discharge_cf) %>%
+  mutate(ym = make_ym(date)) %>%
+  # Aggregate to monthly total per Climate Future (CF) and Model (GCM)
+  group_by(ym, CF, GCM) %>%
+  summarize(discharge_cf = sum(discharge_cf, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    month = month(ym),
+    year  = year(ym),
+    group = case_when(
+      year <= 2012 ~ "Historical",
+      year > 2034 & year < 2070 ~ "Future",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  drop_na(group) %>%
+  # Calculate summary stats per month and CF
+  group_by(month, CF) %>%
+  summarize(
+    monthly_supply_cf     = mean(discharge_cf, na.rm = TRUE),
+    monthly_supply_cf_max = max(discharge_cf, na.rm = TRUE),
+    monthly_supply_cf_min = min(discharge_cf, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    month_date = as_date(paste0("2000-", month, "-01")),
+    month_days = days_in_month(month_date)
+  ) %>%
+  # Calculate fractional distribution across the year
+  group_by(CF) %>%
+  mutate(
+    total_cf         = sum(monthly_supply_cf),
+    monthly_fraction = monthly_supply_cf / total_cf
+  ) %>% 
+  ungroup()
 
+# --- 2. Process Monthly Demand (Long Format) ---
 monthly_use_long <- monthly_use_proportions %>%
-                              #dplyr::select(month_date, mid_use_fut, mid_use_hist, low_use_fut, low_use_hist) %>%
-                              pivot_longer(cols = c(mid_use_fut, mid_use_hist, low_use_fut, low_use_hist, high_use_fut, high_use_hist), names_to = "use_cat", values_to = "use_cf") %>%
-                              dplyr::mutate(month_date = ifelse(use_cat %in% c("mid_use_hist", "low_use_hist", "high_use_hist"), month_date - years(4), 
-                                                                month_date + years(50)),
-                                            new_group = ifelse(grepl("low", use_cat), "low_use",
-                                                               ifelse(grepl("high", use_cat), "high_use", "mid_use"))) %>%
-                              dplyr::select(month_date, new_group, use_cf) %>%
-                              group_by(month_date) %>%
-                              pivot_wider(names_from = new_group, values_from = use_cf)
+  pivot_longer(
+    cols      = matches("(mid|low|high)_use_(fut|hist)"), 
+    names_to  = "use_cat", 
+    values_to = "use_cf"
+  ) %>%
+  mutate(
+    # Offset dates for visualization separation
+    month_date = case_when(
+      grepl("hist", use_cat) ~ month_date - years(4),
+      TRUE                   ~ month_date + years(50)
+    ),
+    new_group = case_when(
+      grepl("low", use_cat)  ~ "low_use",
+      grepl("high", use_cat) ~ "high_use",
+      TRUE                   ~ "mid_use"
+    )
+  ) %>%
+  select(month_date, new_group, use_cf) %>%
+  pivot_wider(names_from = new_group, values_from = use_cf)
 
-
-
-
-
-# Join annual supply and demand
+# --- 3. Demand-Supply (DS) Ratio Analysis ---
 DS_df <- wbm_annual %>%
-  dplyr::select(year, CF, discharge_cf) %>%
+  select(year, CF, discharge_cf) %>%
   left_join(annual_use, by = "year") %>%
-  dplyr::mutate(DS = mid_use / discharge_cf,
-                DS_stress = high_use / discharge_cf,
-                DS_over_pt2 = ifelse(DS >=0.2, 1, 0),
-                DS_over_1 = ifelse(DS>=1,1,0)) 
+  mutate(
+    DS             = mid_use / discharge_cf,
+    DS_stress      = high_use / discharge_cf,
+    DS_over_pt2    = if_else(DS >= 0.2, 1, 0),
+    DS_over_1      = if_else(DS >= 1, 1, 0)
+  )
 
-DS_df_monthly <- wbm_monthly %>%
-  dplyr::select(ym, CF, GCM, discharge_cf) %>%
-  dplyr::mutate(month = month(ym)) %>%
-  dplyr::left_join(monthly_supply_proportions %>% 
-                     dplyr::filter(CF == "Historical") %>%
-                     dplyr::select(month, monthly_fraction), by = "month")
-
+# --- 4. Final Statistics ---
 DS_stats <- DS_df %>%
-  dplyr::filter(year < 2010 & year > 1979 | year > 2034 & year < 2065) %>%
-  dplyr::group_by(CF) %>%
-  dplyr::summarize(n = n(),
-                  high_stress_years = 100 * sum(DS_over_pt2)/ n,
-                  inadequate_supply_years = 100 * sum(DS_over_1)/n)
-                   
+  filter(
+    (year >= 1980 & year <= 2012) | 
+    (year >= 2035 & year <= 2064)
+  ) %>%
+  group_by(CF) %>%
+  summarize(
+    n                       = n(),
+    high_stress_years       = 100 * sum(DS_over_pt2) / n,
+    inadequate_supply_years = 100 * sum(DS_over_1) / n,
+    .groups = "drop"
+  )
 
-DS_stats
-
+print(DS_stats)
 
 ```
 
 # 6. Fire
 
 ```{r fire}
+
+fire_aoi <- park_boundary %>% st_buffer(5000)
+
 # How many known fires have occured within the park?
 new_geomac <- sf::st_read("data/all/InterAgencyFirePerimeterHistory_All_Years_View/InterAgencyFirePerimeterHistory_All_Years_View.shp") 
 
@@ -1546,8 +2002,9 @@ park_new_geomac <- new_geomac %>%
   sf::st_filter(., st_transform(park_boundary %>% st_buffer(5000), crs = st_crs(new_geomac)))
 
 # How much of the recharge area is forested?
-nlcd <- terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img") %>%
-  terra::crop(., st_transform(recharge_aoi, crs = crs(terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img"))), mask = TRUE) %>%
+nlcd <- terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img") 
+nlcd <- nlcd %>%
+  terra::crop(., st_transform(recharge_aoi, crs = crs(nlcd)), mask = TRUE) %>%
   droplevels()
 
 forest_mask <- nlcd %in% c(41, 42, 43)
@@ -1555,7 +2012,7 @@ forest_mask <- nlcd %in% c(41, 42, 43)
 # Fraction of forested area in park (for now):
 park_forested_fraction <- terra::zonal(forest_mask, terra::vect(st_transform(park_boundary, crs = crs(terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img")))), fun = "mean", weights = TRUE, na.rm = TRUE)
 
-recharge_aoi_fraction <- park_forested_fraction <- terra::zonal(forest_mask, terra::vect(st_transform(recharge_aoi, crs = crs(terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img")))), fun = "mean", weights = TRUE, na.rm = TRUE)
+recharge_aoi_fraction <- terra::zonal(forest_mask, terra::vect(st_transform(recharge_aoi, crs = crs(terra::rast("data/all/nlcd_2021_land_cover_l48_20230630/nlcd_2021_land_cover_l48_20230630.img")))), fun = "mean", weights = TRUE, na.rm = TRUE)
 
 burned_fraction_of_watershed <- park_new_geomac %>% 
   dplyr::summarize() %>% 
@@ -1574,14 +2031,14 @@ Gao, P., Terando, A. J., Kupfer, J. A., Varner, J. M., Stambaugh, M. C., Lei, T.
 Fire probability is calculated using a model referred to as PC2FM, which estimates the mean yearly fire interval (MFI). Fire probability is the inverse of MFI (i.e., FP = 1 / MFI). MFI is computed using annual average temperature and precipitation as its primary inputs, as well as factors like molecular collision frequency and activation energy (which influence combustion processes). It is then calibrated using historical fire scar records. Then, future fire probabilities are projected using climate data from the MACAv2 dataset.
 
 ```{r exposure}
-aoi <- recharge_aoi
+aoi <- recharge_aoi %>% st_buffer(500)
 
 water_supply_pyromes <- st_read("data/all/usfs_fire/Pyromes-RDS-2020-0020/Data/Pyromes_CONUS_20200206.shp") %>%
   st_make_valid() %>% 
   sf::st_transform(st_crs(aoi)) %>%
   sf::st_filter(., aoi)
 
-# Cedar Breaksis contained within the Far Southern ROckies pyrom. T
+# Cedar Breaksis contained within the Far Southern Rockies pyrome. 
 mapview(water_supply_pyromes, zcol = "NAME",
         col.regions = pal$gold, alpha.regions = 0.3) + 
   mapview(park_boundary, col.regions = pal$lightblue) 
@@ -1616,7 +2073,20 @@ delta_fireprob <- all_delta_fireprob %>%
   filter(GCM %in% selected_gcms[[1]]$GCM) %>%
   left_join(selected_gcms[[1]], by = "GCM")
 
-ggplot(all_delta_fireprob, aes(x = mean_runoff_in, y = delta_fp)) + geom_point()
+
+fpr <- ggplot(all_delta_fireprob, aes(x = mean_runoff_in, y = delta_fp)) + 
+  geom_point(aes(color = GCM)) +
+  theme_bw() +
+  geom_point(data = delta_fireprob %>%
+               dplyr::filter(CF %in% c("Warm Wet", "Hot Dry")), aes(x = mean_runoff_in, y = delta_fp), shape = 1, size = 5) +
+  labs(x = "Projected Mean Annual Runoff (in)",
+       y = "Delta Fire Probability (Gao et al., 2021)") +
+  geom_smooth(method = "lm", color = "black")
+
+fpr
+
+ggsave("data/park/CEBR/Figs/fire_prob_runoff_corr.jpg", plot = fpr,
+       dpi = 600, height = 5, width = 8, units = "in")
 
 ```
 
@@ -1861,11 +2331,38 @@ spei_metrics <- left_join(
 
 ggplot(spei %>% dplyr::filter(month(ym) == 7), aes(x = spei, y = discharge_gpm)) + 
   geom_point() + 
-  geom_smooth() +
+  geom_smooth(fill = "orange", color = "maroon", alpha = 0.2) +
   theme_bw() +
   labs(x = "SPEI", y = "MeanDischarge (GPM)") +
   scale_color_colorblind()
 #  scale_y_log10()
+
+
+```
+
+# 8. Cold days
+
+
+```{r cold_days}
+
+cold_days <- clim_hist %>%
+  dplyr::filter(year(date) < 2012) %>%
+  group_by(date, CF) %>%
+  dplyr::summarize(tmin_C = min(tmin_C)) %>%
+  bind_rows(clim_fut %>% 
+              dplyr::filter(year(date) > 2034 & year(date) < 2065) %>%
+              left_join(selected_cfs, by = "GCM") %>%
+              drop_na(CF) %>%
+              group_by(date, CF) %>%
+              dplyr::summarize(tmin_C = min(tmin_C))) %>%
+  dplyr::mutate(year = year(date)) %>%
+  ungroup() %>%
+  dplyr::mutate(freeze = ifelse(tmin_C <=0, 1, 0)) %>%
+  group_by(year, CF) %>%
+  dplyr::summarize(n_freeze = sum(freeze),
+                   min_C = min(tmin_C, na.rm = TRUE))
+
+ggplot(cold_days, aes(x = year, y = min_C, color = CF)) + geom_point()
 
 
 ```
@@ -1959,7 +2456,7 @@ dplyr::summarize(mean_supply_cf = mean(discharge_cf),
                 DS = mean(DS),
                 DS_stress = mean(DS_stress),
                 .groups = "keep") %>%
-  dplyr::mutate(across(c("mean_supply_cf", "min_supply_cf", "mean_demand", "high_demand"), .fns = ~ .x/1000000))
+  dplyr::mutate(across(c("mean_supply_cf", "min_supply_cf", "mean_demand", "high_demand"), .fns = ~ .x * cf_to_gal/100000))# IN MILLIONS OF GALLONS!
 
 kable(DS_stats)
 
@@ -1991,10 +2488,11 @@ SD <- monthly_use_long %>%
   pivot_longer(cols = c(mid_use, high_use, daily_use, daily_use_high),
                names_to = "use_cat", values_to = "use") %>%
   dplyr::mutate(SD = Storage_cf / use,
-                use = use/1000,
-                Storage_kcf = Storage_cf/1000,
+                use = use,
                 days_of_use = ifelse(grepl("daily", use_cat), SD, month_days * SD)) %>%
-  dplyr::mutate(across(where(is.numeric), .fns = ~ signif(.x, 2))) 
+  dplyr::mutate(across(c("Storage_cf", "low_use", "use"), .fns = ~ .x * cf_to_gal/1000)) %>%
+  dplyr::mutate(across(where(is.numeric), .fns = ~ signif(.x, 3))) 
+   #
 
 
 kable(SD)
@@ -2028,7 +2526,7 @@ diff_plot <- ggplot(future_differentials %>%
 
 diff_plot
 
-ggsave("docs/Deep Dives/CEBR/Figs/Diff_plot.tif", diff_plot, width = 7, height = 4,  dpi = 600)
+ggsave("data/park/CEBR/Figs/Diff_plot.tif", diff_plot, width = 7, height = 4,  dpi = 600)
 
 ```
 
@@ -2038,154 +2536,447 @@ A map of the
 
 ```{r figure_2}
 
+
+# GET SOME DATA
+
+# Basemap extent wide
 fig_aoi_wide <- park_boundary %>%
   st_buffer(12000) %>%
   dplyr::ungroup() %>%
   st_union(recharge_area %>% st_transform(crs = st_crs(park_boundary))) %>%
-  st_union(nwis_select_stream_gage %>% st_buffer(1000, st_transform(crs= st_crs(park_boundary)))) %>%
+  st_union(nwis_select_stream_gage %>% 
+             st_buffer(1000, st_transform(crs= st_crs(park_boundary)))) %>%
   dplyr::summarize() %>%
   st_convex_hull()
-  #st_buffer(29000)
 
+# Basemap extent regular
 fig_aoi <- park_boundary %>%
-  dplyr::ungroup() %>%
-  st_union(thresh_poly %>% dplyr::summarize() %>% st_transform(crs = st_crs(park_boundary))) %>%
-  dplyr::summarize() #%>%
-  #st_buffer(1000)
+  st_buffer(3000) %>%
+  st_bbox() %>% 
+  st_as_sfc() %>% 
+  st_as_sf() %>% 
+  st_transform(4326)
 
-mapview(fig_aoi) +
-  mapview(fig_aoi_wide, alpha.regions = 0.2, col.regions = "pink") +
-  nwis_select_stream_gage
+# Buildings
+buildings <- getBuildings(park_boundary)
 
-## Download tiles and compose basemap raster (high res, takes a few seconds)
+# Roads
+roads <- opq(bbox = st_bbox(fig_aoi_wide)) %>%
+  add_osm_feature(key = "highway") %>%
+  osmdata_sf() 
+
+roads <- roads$osm_lines %>%
+  mutate(road_type = case_when(
+    highway %in% c("motorway", "trunk", "primary") ~ "Major Highway",
+    highway %in% c("secondary", "tertiary") ~ "Primary Road",
+    TRUE ~ "Local/Minor"
+  )) %>%
+  # Optional: Filter out minor roads entirely if the map is too cluttered
+  filter(road_type != "Local/Minor")
+
+# Other places
+
+places <- opq(bbox = st_bbox(fig_aoi)) %>%
+  add_osm_feature(key = "natural", 
+                  value = c("peak", "volcano", "saddle", "cliff", "bare_rock")) %>%
+  osmdata_sf()
+
+# Keep only the points (nodes) and clean up
+place_points <- places$osm_points %>%
+  filter(!is.na(name)) %>%           # Remove unnamed nodes
+  st_transform(3857)                 # Match your map's CRS (3857)
+
+# --- Group B: Parks and Forests ---
+# These are often polygons, so we extract osm_polygons
+park_forests <- opq(bbox = st_bbox(fig_aoi)) %>%
+  add_osm_feature(key = "leisure", value = "park") %>%
+  add_osm_feature(key = "boundary", value = "national_park") %>%
+  add_osm_feature(key = "landuse", value = "forest") %>%
+  osmdata_sf()
+
+# --- Group C: Trails ---
+# These are lines, so we extract osm_lines
+trails <- opq(bbox = st_bbox(fig_aoi)) %>%
+  add_osm_feature(key = "highway", value = "path") %>%
+  add_osm_feature(key = "route", value = "hiking") %>%
+  osmdata_sf()
+
+
+
+# Basemaps
+
 #tile_maps <- get_tiles(x = fig_aoi, provider =  "Esri.WorldTopoMap", zoom = 13, project = FALSE)
-#tile_maps <- get_tiles(x = park_boundary %>% st_buffer(5000), provider = "OpenTopoMap", zoom = 12)
-tile_maps <- maptiles::get_tiles(x = fig_aoi, 
-                                 provider =  "Esri.WorldTopoMap", 
-                                 zoom = 13, retina = TRUE)
-tile_maps2 <- maptiles::get_tiles(x = fig_aoi, 
-                                  provider = "Esri.WorldShadedRelief", 
-                                  zoom = 13, project = FALSE)
+tile_maps <- get_tiles(x = fig_aoi, 
+                       provider = "CartoDB.PositronOnlyLabels",#"Esri.NatGeoWorldMap", 
+                       zoom = 13, 
+                       project = FALSE)
 
-elev_ras <- elevatr::get_elev_raster(locations = fig_aoi, z = 10)
+tile_maps_wide <- get_tiles(x = fig_aoi_wide, 
+                            provider = "Esri.NatGeoWorldMap", 
+                            zoom = 11, 
+                            project = FALSE)
 
-# Make individual maps objs because these are repeated in multiple figs
-basemap <- tm_shape(tile_maps, 
-                    bbox = st_bbox(fig_aoi)) +
+# Elevation Raster
+elev_ras <- elevatr::get_elev_raster(locations = fig_aoi, z = 14)
+
+
+# Springs join
+
+springs_join <- springs_joined %>%
+          dplyr::filter(!new_name %in% c("Blowhard Spring", "Shooting Star Spring", "Twin Springs", "Twin Spring", "79033326 NHD_ID")) %>%
+                    st_transform(crs = st_crs(fig_aoi)) %>%
+                    st_filter(fig_aoi %>% st_bbox() %>% st_as_sfc()) %>%
+                    dplyr::mutate(Springs = "Other Springs",
+                                  new_lab = "") %>%
+                    dplyr::select(Springs, new_lab) %>%
+    st_transform(crs = st_crs(samp_locs)) %>%
+      bind_rows(
+        samp_locs %>% 
+             dplyr::filter(location %in% c("Blowhard Spring", "Shooting Star Spring", "Twin Spring", "Twin Springs")) %>%
+             dplyr::mutate(new_lab = gsub(" Spring", "", location),
+                           "Springs" = ifelse(location == "Blowhard Spring", "Current Supply", "Historical Supply")) %>%
+  dplyr::select(Springs, new_lab))
+
+  
+
+```
+
+```{r site_figure}
+
+
+site_fig <- 
+  
+  #1. Elevation
+  tm_shape(elev_ras, bbox = fig_aoi) +
+  tm_raster(col.scale = 
+              tm_scale_continuous(values = hcl.colors(5, 
+                                    pal = "Earth"),
+                                  n = 2),
+            col_alpha = 1,
+            col.legend = tm_legend(
+              title = "Elevation (m)",
+              reverse = TRUE,
+              orientation = "landscape")
+          ) +
+  
+  
+  # 4. Roads
+   tm_shape(roads) +
+  tm_lines(col = "white",
+          lwd = "road_type",
+          lwd.scale = tm_scale_categorical(values = c(4, 2)),
+          lwd.legend = tm_legend(show = FALSE)) +
+  tm_shape(roads) +
+  tm_lines(col = "road_type",
+          col.scale = tm_scale_categorical(values = c("gray50", "gray80")),
+          lwd = "road_type",
+          lwd.scale = tm_scale_categorical(values = c(2.5, 1)),
+          lwd.legend = tm_legend(show = FALSE),
+          col.legend = tm_legend(show = FALSE)
+        ) +
+
+  
+  # 2. Recharge Area - Muted Fill instead of neon outline
+  tm_shape(recharge_area %>% st_transform(3857) %>% dplyr::mutate(name = "Blowhard Recharge Area")) +
+  tm_polygons(fill = "name",
+              fill.scale = tm_scale_categorical(values = c("dodgerblue")),
+              fill_alpha = 0.2, 
+              col = "dodgerblue4", 
+              lwd = 1.5, 
+              lty = "solid",
+              fill.legend = tm_legend(title = "", 
+                                      show = TRUE)) +
+  
+  tm_shape(watersheds %>% dplyr::mutate(other_name = "Watersheds") %>%
+             st_transform(st_crs(fig_aoi)) %>%
+             st_intersection(fig_aoi %>% st_buffer(100)) %>%
+             dplyr::mutate(
+               name = case_when(
+                 name == "Jack Rabbit Wash-Rush Lake" ~ "Ashdown / Coal Creek",
+                 name == "Asay Creek" ~ "Midway Valley-Midway Creek",
+                 TRUE ~ name))
+             ) +
+  tm_polygons(col = "other_name",
+              col.scale = tm_scale_categorical(values = "dodgerblue4"),
+              fill_alpha = 0,
+              lty = "dotted",
+              lwd = 2,
+              col.legend = tm_legend(title = "")) +
+  tm_text("name",
+          size = .8,
+           col = "dodgerblue4",
+          ymod = 2,
+          fontface = "bold",
+           options = opt_tm_text(
+            just = "center",
+            shadow = FALSE)) +
+  
+  # 3. Stream Network
+  tm_shape(park_flowlines %>% 
+             st_transform(4326) %>%
+             dplyr::filter(FCode %in% c(46005, 46006)) %>% 
+             st_intersection(fig_aoi) %>%
+           st_transform(3857) %>%
+           dplyr::group_by(GNIS_Name) %>%     # Group segments by name
+           dplyr::summarize()  %>%
+             dplyr::mutate(GNIS_Name = ifelse(
+               GNIS_Name == "Unknown", "", GNIS_Name))# Merge geometries
+         ) + 
+  tm_lines(lwd = 0.8, 
+           col = "dodgerblue") +
+    
+  
+  # Geofeatures
+  tm_shape(places$osm_points %>% 
+           st_transform(3857) %>% 
+           filter(!is.na(name))) +
+  tm_symbols(shape = 24, 
+             col_alpha = 1,
+             fill_alpha = 0,
+             size = 0.5, 
+             fill = "white", 
+             col = "white") +
+  tm_text("name",
+          size = 0.8, 
+          col = "white",
+          fontface = "italic",
+          xmod = -0.4,
+          # This is the v4 'Layer Options' structure:
+          options = opt_tm_text(
+            shadow = FALSE,
+            just = "right",
+            remove_overlap = TRUE
+          )) +
+  
+  
+  # 5. Park Boundary
+  tm_shape(park_boundary %>% 
+             dplyr::mutate(lab = "Cedar Breaks\nNational Monument")) +
+  tm_polygons(fill_alpha = 0, 
+          lwd = 2, 
+          col = "seagreen") +
+  tm_labels("lab",
+            size = 0.9,
+            ymod = 4, 
+            xmod = 1,
+            col = "seagreen",
+            bg.color = "white",
+            bg.alpha = 0.7,
+            fontface = "bold") +
+
+  # 6. Faults
+  tm_shape(nps_faults %>%
+         st_transform(3857) %>%
+         dplyr::mutate(name = "Faults")) +
+  tm_lines("name",
+         lwd = 2,
+         lty = 2,
+         col.scale = tm_scale_categorical(values = c("gray50")),
+         col_alpha = .6,
+         col.legend = tm_legend(show = TRUE, title = "")) +
+  
+  # 7. Springs (Consolidated Legend)
+  tm_shape(springs_join) +
+  tm_dots(fill = "hotpink",
+          shape = "Springs",
+          shape.scale = tm_scale_categorical(values = c(23, 22, 21)),
+          fill_alpha = "Springs",
+          fill_alpha.scale = tm_scale_categorical(values = c(1, 1, 0.4)),
+          size = "Springs",
+          size.scale = tm_scale_categorical(values = c(.75,.5,.5)),
+          col = "black", # Darker border makes them pop against elevation
+          lwd = 0.5,
+          shape.legend = tm_legend(title = "Springs"),
+          fill_alpha.legend = tm_legend(show = FALSE),
+          size.legend = tm_legend(show = FALSE)) +
+ 
+  tm_labels("new_lab",
+            size = 0.7,
+            ymod = 0, 
+            xmod = 0,   
+            bg.color = "white",
+            bg.alpha = 0.7,
+            fontface = "bold",
+            col = "black") +    # Color of the leader line
+  
+  # 8. Map Elements
+  tm_scalebar(position = c("right", "bottom"), text.size = 0.6) +
+  tm_compass(position = c("left", "top"), size = 1.5) +
+  
+  #tm_title("Cedar Breaks National Monument") +
+  
+ tm_layout(
+    legend.outside = TRUE,
+    legend.outside.position = "bottom",
+    legend.margin = 0,
+    outer.margins = c(0, 0, 0, 0),
+    inner.margins = c(0, 0, 0, 0),
+    frame = TRUE, 
+    legend.frame = FALSE,            
+    legend.bg = FALSE,            
+    legend.frame.lwd = 0,            
+    legend.title.size = 0.8,
+    legend.text.size = 0.8
+  )
+
+  
+site_fig
+
+
+# Save
+tmap_save(site_fig, dpi = 600, filename = "data/park/CEBR/Figs/Site_fig.jpg", width = 7, height = 9)
+```
+
+#### Watersheds Figure
+```{r}
+
+watersheds_figure <- 
+  tm_shape(tile_maps_wide, 
+           bbox = st_bbox(fig_aoi_wide)) +
   tm_rgb() +
-  #tm_shape(tile_maps2) + 
-  #tm_rgb(col_alpha = 0.2)
-  tm_shape(elev_ras) +
-  tm_raster(col.scale = tm_scale_continuous(values = hcl.colors(10, pal = "Earth")),
-            col_alpha = 0.4) +
-  tm_legend_hide()
+  
+  tm_shape(park_boundary) +
+  tm_polygons(fill_alpha = 0, 
+              lwd = 1.5, 
+              col = "black") +
+  
+tm_shape(watersheds) +
+  tm_polygons(fill = "name",
+              fill.scale = tm_scale_categorical(),
+              fill_alpha = 0.4,
+              fill.legend = tm_legend(title = "Watersheds")) +
+  tm_shape(springs_join) +
+  tm_dots(
+    fill = "hotpink",
+    shape = "Springs",
+    shape.scale = tm_scale_categorical(values = c(23,22,20)),
+    fill_alpha = "Springs",
+    fill_alpha.scale = tm_scale_categorical(values = c(1,1,.5)),
+    size = .6,
+    col = "white", 
+    lwd = 1,
+    fill.legend = tm_legend(show = FALSE),
+    shape.legend = tm_legend(title = "Springs"),
+    fill_alpha.legend = tm_legend(show = FALSE)
+  ) +
 
-pb_map <- tm_shape(park_boundary) +
-  tm_borders("UNIT_NAME",
-              col.scale = tm_scale_categorical(values = c(pal$teal)), 
-              col_alpha = 0.7, 
-              lwd = 2, 
-              fill.legend = tm_legend(show = FALSE, title = "", stack = "vertical")) 
-
-samp_fig <- tm_shape(samp_locs %>% 
-                       #dplyr::filter(location != "Blowhard Spring") %>%
-                       dplyr::mutate(new_lab = gsub(" Spring","",location),
-                                     type = ifelse(location == "Blowhard Spring", "Water Supply", "Rim Springs"))) +
-  tm_dots(shape = "type",
-             #col.scale = tm_scale_categorical(values = c("black")),
-          fill = "tomato",
-          fill_alpha = 1,
-          size = .6,
-          shape.scale = tm_scale_categorical(values = c(21,23)),
-          shape.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) +
   tm_labels("new_lab",
-            size = 0.75,
-            remove.overlap = FALSE, xmod = .5, ymod = .2)
-
-bh_map <- tm_shape(samp_locs %>% 
-                       dplyr::filter(location == "Blowhard Spring") %>%
-                       dplyr::mutate(new_lab = gsub(" Spring","",location),
-                                     type = "Water Supply Spring")) +
-  tm_dots("type",
-             #col.scale = tm_scale_categorical(values = c("black")),
-             fill.scale = tm_scale_categorical(values = c("tomato")),
-          fill_alpha = 0.7,
-          size = .6,
+            size = 0.7,
+            ymod = 0.6, 
+            bg.color = "white",
+            bg.alpha = 0.7,
+            fontface = "bold") +
+  
+ tm_shape(nwis_select_stream_gage %>% 
+           st_transform(3857) %>%
+           dplyr::mutate(lab = "NWIS Stream Gauges")) +
+  tm_dots(fill = "lab",
+          fill.scale = tm_scale_categorical(values = "dodgerblue"),
+          size = 0.7,
           shape = 23,
-          fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) +
-  tm_labels("new_lab",
-            size = 0.75,
-            remove.overlap = FALSE, xmod = .5, ymod = .2)
+          # FIX: use 'col' instead of 'border.col'
+          col = "white", 
+          # FIX: use 'tm_scale' for the border width or set it globally
+          lwd = 2, 
+          fill.legend = tm_legend(show = TRUE, title = ""))
 
-nwis_map <- tm_shape(nwis_select_stream_gage %>% st_transform(3857)) +
+watersheds_figure
+
+```
+
+#### Geology Figure
+```{r geo_figure}
+
+geo_figure <- 
+  tm_shape(tile_maps, 
+           bbox = st_bbox(fig_aoi)) +
+  tm_rgb() +
+  
+  tm_shape(park_boundary) +
+  tm_polygons(fill_alpha = 0, 
+              lwd = 1.5, 
+              col = "black") +
+  
+  tm_shape(nwis_select_stream_gage %>% st_transform(3857)) +
   tm_dots("site_no",
           fill.scale = tm_scale_categorical(values = c(pal$pink)),
           size = .7,
           border.col = "white",
           lwd = 2,
-          shape = 23) 
-
-other_springs_fig <- tm_shape(bind_rows(SSI_springs, springs[,1:2]) %>%
-                                st_transform(crs = st_crs(fig_aoi)) %>%
-                                st_filter(fig_aoi %>% st_bbox() %>% st_as_sfc()) %>%
-                                dplyr::mutate(lab = "Other Springs")) +
-  tm_dots("lab",
-          size = 0.3,
-          fill.scale = tm_scale_categorical(values = c("tomato")),
-          fill_alpha = 1,
-          fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical"))
-
-claron_red_map <- tm_shape(nps_geo %>% 
-              dplyr::filter(GLG_SYM %in% claron_pink) %>% 
-              st_transform(3857) %>%
-              dplyr::summarize() %>% dplyr::mutate(name = "Claron (Red)")) +
-          tm_polygons("name",
-              fill.scale = tm_scale_categorical(values = c("salmon4")),
-              fill_alpha = .4,
-              lwd = 0,
-              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
-
-claron_white_map <- tm_shape(nps_geo %>% 
+          shape = 23) +
+# Claron Formation outcrop extent
+  tm_shape(nps_geo %>% 
+        dplyr::filter(GLG_SYM %in% c(claron_pink)) %>% 
+        st_transform(3857) %>%
+        dplyr::summarize() %>% dplyr::mutate(name = "Claron (Red)")) +
+  tm_polygons("name",
+        fill.scale = tm_scale_categorical(values = c("salmon4")),
+        fill_alpha = .4,
+        lwd = 0,
+        fill.legend = tm_legend(show = TRUE, title = "")) +
+ tm_shape(nps_geo %>% 
               dplyr::filter(GLG_SYM %in% claron_white) %>% 
               st_transform(3857) %>%
-              dplyr::summarize() %>% dplyr::mutate(name = "Claron (White)")) +
+              dplyr::summarize() %>% 
+            dplyr::mutate(name = "Claron (White)")) +
           tm_polygons("name",
               fill.scale = tm_scale_categorical(values = c("wheat3")),
               fill_alpha = .5,
               lwd = 0,
-              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
-
-alluv_map <- tm_shape(nps_geo %>% dplyr::filter(GLG_SYM %in% q_colluv) %>% 
+              fill.legend = tm_legend(show = TRUE, title = "")) + 
+  tm_shape(nps_geo %>% dplyr::filter(GLG_SYM %in% q_colluv) %>% 
              dplyr::summarize() %>% 
              st_transform(3857) %>%
              dplyr::mutate(name = "Colluvium/Alluvium")) +
           tm_polygons("name",
-              fill.scale = tm_scale_categorical(values = c("khaki")),
+              fill.scale = tm_scale_categorical(values = c("seagreen4")),
               fill_alpha = .4,
               lwd = 0,
-              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
-
-volc_map <- tm_shape(nps_geo %>% 
+              fill.legend = tm_legend(show = TRUE, title = "")) +
+  tm_shape(nps_geo %>% 
               dplyr::filter(GLG_SYM %in% volcanic) %>% 
               st_transform(3857) %>%
-              dplyr::summarize() %>% dplyr::mutate(name = "Volcanics")) +
+              dplyr::summarize() %>% 
+             dplyr::mutate(name = "Volcanics")) +
             tm_polygons("name",
-              fill.scale = tm_scale_categorical(values = c("hotpink2")),
+              fill.scale = tm_scale_categorical(values = c("hotpink4")),
               fill_alpha = .4,
               lwd = 0,
-              fill.legend = tm_legend(show = TRUE, title = "", stack = "vertical")) 
-
-fault_map <- tm_shape(nps_faults %>%
+              fill.legend = tm_legend(show = TRUE, title = "")) +
+  tm_shape(nps_faults %>%
                st_transform(3857) %>%
                dplyr::mutate(name = "Faults")) +
             tm_lines("name",
                lwd = 2,
                col.scale = tm_scale_categorical(values = c("gray50")),
                col_alpha = .8,
-               col.legend = tm_legend(show = TRUE, title = "", stack = "vertical"))
+               col.legend = tm_legend(show = TRUE, title = "")) +
+  
+  tm_shape(springs_join) +
+  tm_dots(
+    fill = "hotpink",
+    shape = "Springs",
+    shape.scale = tm_scale_categorical(values = c(23,22,20)),
+    fill_alpha = "Springs",
+    fill_alpha.scale = tm_scale_categorical(values = c(1,1,.5)),
+    size = .6,
+    col = "white", 
+    lwd = 1,
+    fill.legend = tm_legend(show = FALSE),
+    shape.legend = tm_legend(title = "Springs"),
+    fill_alpha.legend = tm_legend(show = FALSE)
+  ) +
+  tm_labels("new_lab",
+            size = 0.7,
+            ymod = 0.6, 
+            bg.color = "white",
+            bg.alpha = 0.7,
+            fontface = "bold")
 
-flowline_map <- tm_shape(park_flowlines %>% st_transform(3857) ) + #%>% group_by(GNIS_Name) %>% dplyr::filter(NHDPlusID ==                        max(NHDPlusID)) %>% #bind_cols(p_ang = c(43,-35,0,30,-20, 0,-30))) +
-                tm_lines(lwd = 0.5, col = pal$lightblue)
+geo_figure
+
+
+
 
 rch_elev_map <- tm_shape(thresh_elev/.3048) +
            tm_raster("Elevation",
@@ -2273,10 +3064,113 @@ rch_fig <- basemap +
 
 rch_fig
 
-tmap_save(rch_fig, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Rch_Fig.png", width = 6.5, height = 6.6)
+
 
 
 ```
+
+```{r}
+
+library(ggplot2)
+library(ggspatial)
+library(tidyterra) # For geom_spatraster
+library(sf)
+
+# 1. Prepare Data (ensure all CRS match your fig_aoi)
+target_crs <- st_crs(fig_aoi)
+
+# Extract bbox limits for the extent
+aoi_lims <- st_bbox(fig_aoi)
+
+# Convert the RasterLayer to a SpatRaster
+elev_spat <- terra::rast(elev_ras)
+
+nps_geo_filtered <- nps_geo %>% 
+        dplyr::filter(GLG_SYM %in% c(claron_pink, claron_white)) %>% 
+        st_transform(3857) %>%
+        dplyr::summarize() %>% dplyr::mutate(name = "Claron Outcrop")
+
+other_springs <- springs_joined %>%
+          dplyr::filter(!new_name %in% c("Blowhard Spring", "Shooting Star Spring", "Twin Springs", "Twin Spring", "79033326 NHD_ID")) %>%
+                    st_transform(crs = st_crs(fig_aoi)) %>%
+                    st_filter(fig_aoi %>% st_bbox() %>% st_as_sfc()) %>%
+                    dplyr::mutate(lab = "Other Springs")
+
+samp_locs_filtered <- samp_locs %>% 
+             dplyr::filter(location %in% c("Blowhard Spring", "Shooting Star Spring", "Twin Spring", "Twin Springs")) %>%
+             dplyr::mutate(new_lab = gsub(" Spring", "", location),
+                           "Water Supply Spring" = ifelse(location == "Blowhard Spring", "Current", "Historical"))
+
+# Note: In ggplot, we plot from bottom (first) to top (last)
+ggplot() +
+  
+  # --- BASEMAP ---
+  annotation_map_tile(type = "cartolight", zoom = 2) +
+  
+  # --- ELEVATION (as a semi-transparent layer) ---
+  geom_spatraster(data = elev_spat, alpha = 0.6) +
+  scale_fill_gradientn(colors = hcl.colors(20, pal = "Earth"), 
+  name = "Elevation (m)",
+  na.value = "transparent"
+    ) +
+  guides(fill = guide_colorbar(barheight = unit(3, "cm"))) +
+  
+  geom_sf(data = park_boundary, fill = "seagreen", alpha = 0.2, color = "black") +
+  
+  # --- CLARON OUTCROP ---
+  geom_sf(data = nps_geo_filtered, fill = "salmon", alpha = 0.4, color = NA) +
+  
+  # --- FAULTS ---
+  geom_sf(data = nps_faults, color = "gray50", linetype = "dashed", size = 0.8) +
+  
+  # --- ROADS (The "Casing + Fill" trick) ---
+  # Casing
+  geom_sf(data = roads, aes(size = road_type), color = "grey20") +
+  # Center Fill
+  geom_sf(data = roads, aes(size = road_type, color = road_type)) +
+  
+  scale_color_manual(values = c("Major Highway" = "gold", "Primary Road" = "white"), guide = "none") +
+  scale_size_manual(values = c("Major Highway" = 1.5, "Primary Road" = 0.8), guide = "none") +
+
+  # --- SPRINGS ---
+  geom_sf(data = other_springs, color = "dodgerblue", alpha = 0.5, size = 1.5) +
+  
+  # --- SAMPLING POINTS ---
+  geom_sf(data = samp_locs_filtered, aes(color = "Water Supply Spring"), 
+          shape = 23, size = 3, color = "white") +
+  #scale_fill_manual(values = c("Current" = "hotpink", "Historical" = "dodgerblue"), 
+  #                  name = "Water Supply") +
+  
+  # --- LABELS ---
+  geom_sf_label(data = samp_locs_filtered, aes(label = new_lab), 
+                nudge_y = 0.005, fontface = "bold", alpha = 0.7) +
+  
+  # --- LAYOUT ---
+  coord_sf(crs = target_crs) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        legend.background = element_rect(fill = "white", color = NA)) +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tl", which_north = "true") +
+  
+  # --- EXTENT & LAYOUT ---
+  coord_sf(xlim = c(aoi_lims["xmin"], aoi_lims["xmax"]),
+           ylim = c(aoi_lims["ymin"], aoi_lims["ymax"]),
+           crs = target_crs, expand = FALSE) +
+  
+  theme_minimal() +
+  theme(legend.position = "right",
+        legend.background = element_rect(fill = "white", color = "grey80"),
+        legend.key = element_blank()) +
+  
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tl", which_north = "true", 
+                         style = north_arrow_minimal())
+
+
+```
+
+
 
 #### Surface Water
 
@@ -2361,8 +3255,9 @@ pdat <- blowhard_mtn_m %>%
   #dplyr::left_join(snotel_m, by = "ym") %>% 
   left_join(wbm %>% dplyr::filter(year(date) < 1985) %>% dplyr::mutate(ym = make_ym(date)) %>%
               dplyr::group_by(ym) %>%
-              dplyr::select(ym, runoff_in_wbm, snow_in_wbm, melt_in_wbm, precip_in_wbm, runoff_gpm) %>%
+              dplyr::select(ym, runoff_in_wbm, snow_in_wbm, melt_in_wbm, precip_in_wbm, runoff_gpm, discharge_gpm) %>%
               dplyr::summarize(runoff_in_wbm = sum(runoff_in_wbm),
+                               discharge_gpm = quantile(discharge_gpm, .6),
                                runoff_gpm = mean(runoff_gpm),
                                melt_in_wbm = sum(melt_in_wbm),
                                precip_in_wbm = sum(precip_in_wbm),
@@ -2374,44 +3269,62 @@ pdat <- blowhard_mtn_m %>%
 
 f4 <- ggplot(pdat, aes(x = ym)) +
   #geom_line(aes(y = .01 * runoff_gpm), color = "black", lwd = 2, alpha = 0.8, lineend = "round") +
-  geom_line(aes(y = runoff_gpm), lwd = 2, color = "black", alpha = 0.8, lineend = "round") +
-  geom_line(aes(y =  runoff_gpm, col = "WBM Runoff (gpm)"), lwd = 1.5, alpha = 0.8, lineend = "round") +
-  geom_line(aes(y = snow_melt), color = "black", lineend = "round", lwd = 2) +
-  geom_line(aes(y = snow_melt, color = "Blowhard Mtn. Snowmelt (in)"), lwd = 1.5, lineend = "round") +
-  geom_point(aes(y = flow_gpm, color = "Blowhard Flow (gpm)"), fill = pal$lightblue, size = 2, shape = 21) +
+  #geom_line(aes(y = runoff_gpm), lwd = 2, color = "black", alpha = 0.8, lineend = "round") +
+  #geom_line(aes(y =  runoff_gpm, col = "WBM Runoff (gpm)"), lwd = 1.5, alpha = 0.8, lineend = "round") +
+  #geom_line(aes(y = discharge_gpm), color = "black", lineend = "round", lwd = 2) +
+  #geom_line(aes(y = snow_melt, color = "Blowhard Mtn. Snowmelt (in)"), lwd = 1.5, lineend = "round") +
+  geom_rect(aes(xmin = as.Date("1983-01-01"), xmax = as.Date("1984-01-01"), ymin = -Inf, ymax = Inf),
+            fill = "grey85", linewidth = 0,  alpha = .1) + 
+  geom_line(aes(y = discharge_gpm, color = "Unknown Actual Discharge"),alpha = 0.5, lwd = 1, linetype = "dashed") +
+  geom_point(aes(y = flow_gpm, color = "Measured Discharge"), fill = pal$lightblue, size = 2, shape = 21) +
   theme_bw() +
   xlim(as.Date("1979-01-01"), as.Date("1985-01-01")) +
   theme(legend.position = "bottom",
         legend.margin = margin(t = -20, b = 0, l = 0, r = 0)) +
-  scale_color_manual("", values = c("black", "gray60", pal$pink)) +
+  scale_color_manual("", values = c("black", "gray0", pal$pink)) +
   scale_fill_manual("", values = c(pal$darkblue)) +
-  labs(x = "", y = "Flow Component")
+  labs(x = "", y = "Blowhard Spring\n Discharge (gpm)")
 
 
 f4
 
-ggsave(f4, filename = "docs/Deep Dives/CEBR/Figs/Figure_4_Blowhard_Flow.tiff", width = 7, height = 2.5,  dpi = 600)
+ggsave(f4, filename = "data/park/CEBR/Figs/Figure_4_Blowhard_Flow.tiff", width = 7, height = 2.5,  dpi = 600)
 
 
 ```
 
 ```{r runoff_routing_model_fig}
 # Plot of modeled springflow and runoff
-flow_mod_fig <- ggplot(springflow, aes(x = date)) +
+
+springflow_plot <- springflow %>%
+  dplyr::mutate(Q_tot_min = springflow_min$Q_tot,
+                Q_tot_max = springflow_max$Q_tot) %>%
+  dplyr::group_by(year(date)) %>%
+  dplyr::mutate(annual_mean_Q_tot = mean(Q_tot, na.rm = TRUE))
+
+# Plot of modeled springflow and runoff
+flow_mod_fig <- ggplot(springflow_plot, aes(x = date)) +
   geom_rect(aes(xmin = as.Date("1983-01-01"), xmax = as.Date("1984-01-01"), ymin = -Inf, ymax = Inf),
             fill = "grey85", linewidth = 0,  alpha = .1) + 
-  
+  geom_ribbon(aes(x = date, ymin = Q_tot_min, ymax = Q_tot_max), fill = pal$lightblue, alpha = 0.5, linewidth = 1.5, lineend = "round") + 
   geom_line(aes(x = date, y = Q_tot), color = "black", linewidth = 1.5, lineend = "round") + 
   geom_line(aes(x = date, y = Q_tot, color = "Modeled"), linewidth = 1, lineend = "round") + 
+  
   geom_point(aes(y = flow_gpm, color = "Observed"), size = 2, shape = 21, fill = pal$darkblue) +
+  # geom_line(aes(x = date, y = annual_mean_Q_tot), color = "black", linewidth = 1, lineend = "round", linetype = "dotted") + 
+  
   theme_bw() +
   labs(x = "", y = "Flow (gpm)") +
   scale_color_manual("", values = c(pal$lightblue, "black", pal$lightblue))
 
+
 flow_mod_fig
+
+ggsave(flow_mod_fig, filename = "data/park/CEBR/Figs/Blowhard_Flow_mod.tiff", width = 7, height = 2.5, dpi = 600)
+
 ```
 
-ggsave(flow_mod_fig, filename = "docs/Deep Dives/CEBR/Figs/Blowhard_Flow_mod.tiff", width = 7, height = 2.5, dpi = 600)
+
 
 #### Water Budget
 
@@ -2435,7 +3348,8 @@ plot_dat <- wbm_annual %>%
                 #"Recharge (in)" = "recharge_in_wbm") %>%
   tidyr::pivot_longer(-c(year, GCM, CF), names_to = "vars", values_to = "vals") %>%
   dplyr::group_by(vars, CF, GCM) %>%
-  dplyr::mutate(roll_vals = data.table::frollmean(vals, 10, align = c("center")))
+  dplyr::mutate(roll_vals = data.table::frollmean(vals, 10, align = c("center"))) %>%
+  dplyr::mutate(CF = factor(CF, levels = c("Historical", "Wetter", "Drier")))
 
 wb_fig <- ggplot(plot_dat) + 
   # Add shaded region between 2035 and 2065
@@ -2449,7 +3363,7 @@ wb_fig <- ggplot(plot_dat) +
   theme_bw() +
   scale_color_manual("", values = c("Historical" = "#a9a9a9", "Drier" = "#c5312a", "Wetter" = "#85b6dc")) +
   scale_fill_manual("", values = c("#a9a9a9", "#c5312a","#85b6dc"),
-                    labels = c("Historical", "Hot Dry", "Warm Wet")) +
+                    labels = c("Historical", "Drier", "Wetter")) +
   labs(y = "", x = "") +
   facet_wrap(~ factor(vars, levels = c("Temperature (F)",
                                        "Precipitation (in)",
@@ -2465,7 +3379,7 @@ wb_fig <- ggplot(plot_dat) +
 
 wb_fig
 
-ggsave(wb_fig, filename = "docs/Deep Dives/CEBR/Figs/WaterBalance.tif", width = 9, height = 5,  dpi = 600)
+ggsave(wb_fig, filename = "data/park/CEBR/Figs/WaterBalance.tif", width = 9, height = 5,  dpi = 600)
 ```
 
 #### Visitation
@@ -2477,75 +3391,79 @@ ggsave(wb_fig, filename = "docs/Deep Dives/CEBR/Figs/WaterBalance.tif", width = 
 vis_fig <- list(4)
 #Plot historical visitation
 vis_fig[[1]] <- ggplot(monthly_visitor_proportions) +
-   geom_ribbon(aes(x = month_date, ymin = TV_min, ymax = TV_max, fill = "Historical"), alpha = 0.3) +
+   geom_ribbon(aes(x = month_date, ymin = TV_min, ymax = TV_max, fill = "Historical (Recorded)"), alpha = 0.3) +
    geom_line(aes(x = month_date, y = TV_mean), color = "black", lineend = "round", lwd = 2) +
-    geom_line(aes(x = month_date, y = TV_mean, color = "Historical"), lwd = 1, lineend = "round") +
-   geom_ribbon(aes(x = month_date, ymin = fut_min, ymax = fut_max, fill = "Projected"), alpha = 0.4) +
-   geom_line(aes(x = month_date, y = fut_mean), color = "black", lineend = "round", lwd = 2) +
-    geom_line(aes(x = month_date, y = fut_mean, color = "Projected"), lwd = 1, lineend = "round") +
+    geom_line(aes(x = month_date, y = TV_mean, color = "Historical (Recorded)"), lwd = 1, lineend = "round") +
+   geom_ribbon(aes(x = month_date, ymin = fut_min_vis, ymax = fut_max_vis, fill = "Projected"), alpha = 0.4) +
+   geom_line(aes(x = month_date, y = fut_mean_vis), color = "black", lineend = "round", lwd = 2) +
+    geom_line(aes(x = month_date, y = fut_mean_vis, color = "Projected"), lwd = 1, lineend = "round") +
     # Add an invisible line to create the legend entry
   #geom_point(aes(x = month_date, y = fut_mean*NA, color = "Historical GAM", fill = "Historical Gam"), pch = 21) +
     theme_bw() +
-   scale_color_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
-  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
+   scale_color_manual("", values = c("Projected" = pal$orange, "Historical (Recorded)" = pal$darkblue, "Historical GAM" = "gray")) +
+  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical (Recorded)" = pal$darkblue, "Historical GAM" = "gray")) +
   scale_y_continuous(labels = scales::label_number(scale = 1e-3, suffix = "K")) +
     labs(x = "", y = "Monthly Visitors") +
   scale_x_date(labels = date_format("%b")) +
     theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+
+vis_fig[[1]]
   
-pdat <- vis_clim %>% dplyr::mutate(c_group = ifelse(year < 2025, "Historical", "Projected"))
+pdat <- vis_clim %>% 
+  dplyr::mutate(c_group = ifelse(year < 2025, "Historical (Recorded)", "Projected"),
+                vis_smooth_mid = ifelse(year < 2025, TotalVisitors, vis_smooth_mid),
+                vis_pred = ifelse(year < 2025, TotalVisitors, vis_pred),
+                vis_smooth_low = ifelse(year < 2025, NA, vis_smooth_low),
+                vis_smooth_high = ifelse(year < 2025, NA, vis_smooth_high)) %>%
+  dplyr::filter(year < 2100)
 
 vis_fig[[2]] <- ggplot(pdat) +
   geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf), fill = "lightgrey", alpha = 0.3) + 
-  #geom_ribbon(aes(x = year, ymin = vis_pred_low, ymax = vis_pred_high, fill = c_group), lwd = 0, alpha = 0.4) +
-  geom_ribbon(aes(x = year, ymin = low_smooth, ymax = high_smooth, fill = c_group), alpha = 0.4, lwd = 0) +
-  geom_line(aes(x = year, y = vis_pred_lin), color = "black", lwd = 2, lineend = "round") +
-  geom_line(aes(x = year, y = vis_pred_lin, color =  c_group, fill = c_group), lwd = 1, lineend = "round") +
-  #geom_line(aes(x = year, y = his_vis_pred), lwd = 2, color = "black", lineend = "round") +
-  #geom_line(aes(x = year, y = his_vis_pred, color = "Historical GAM"), lwd = 1, lineend = "round") +
-  geom_point(aes(x = year, y = TotalVisitors), color = "black", pch = 21, size = 2) +
-  geom_point(data = pdat %>% dplyr::filter(year > 2025), aes(x = year, y = vis_pred), fill = pal$orange, pch = 21, size = 2, color = "black", alpha = 0.5) +
+  geom_ribbon(aes(x = year, ymin = vis_smooth_low, ymax = vis_smooth_high, fill = c_group), alpha = 0.4, lwd = 0) +
+  geom_line(aes(x = year, y = vis_smooth_mid), color = "black", lwd = 1, lineend = "round") +
+  geom_line(aes(x = year, y = vis_smooth_mid, color =  c_group, fill = c_group), lwd = .5, lineend = "round") +
+  geom_point(aes(x = year, y = vis_pred, fill = c_group), pch = 21, size = 2, color = "black", alpha = 0.7) +
   theme_bw() +
   scale_y_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
-  scale_color_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
-  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
+  scale_color_manual("", values = c("Projected" = pal$orange, "Historical (Recorded)" = pal$darkblue, "Historical GAM" = "gray")) +
+  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical (Recorded)" = pal$darkblue, "Historical GAM" = "gray")) +
   labs(x = "", y = "Annual Visitors") +
   theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
 
 vis_fig[[2]]
 
-vis_fig[[3]] <- ggplot(vis_mod_dat, aes(x = tmean, y = TotalVisitors)) + 
+vis_fig[[3]] <- ggplot(vis_clim %>% dplyr::filter(year < 2025), aes(x = tmean_F, y = TotalVisitors)) + 
             geom_point(size = 2) +
             geom_smooth(method = "lm", se = FALSE, color = "black", lwd = 2, lineend = "round") +
             geom_smooth(method = "lm", se = FALSE, color = pal$darkblue, lwd = 1.5, lineend = "round") +
             theme_bw() + 
             labs(x = "Mean Annual Temperature (F)", y = "Annual Visitors")
 
-vis_fig[[4]] <- ggplot(vis_mod_dat, aes(x = year)) + 
-            geom_ribbon(aes(ymin = vis_pred_low, ymax = vis_pred_high), fill = pal$darkblue, lwd = 0, alpha = 0.5) +
-  geom_line(aes(y = vis_pred), lwd = 2, color = "black", lineend = "round") +
-  geom_line(aes(y = vis_pred), lwd = 1.5, color = pal$darkblue, lineend = "round") +
-            geom_point(aes(y = TotalVisitors), color = "black", size = 2) +
-            annotate("text", x = 1988, y = 9.5e05, label =  r2_label) +
-            annotate("text", x = 1988, y = 9e05, label =  p_label) +
-            theme_bw() + 
-            scale_color_manual("", values = c("black", nps_pal$red, nps_pal$blue)) +
-            labs(x = "", y = "Annual Visitors")
-
+vis_fig[[4]] <- ggplot(comparison_df) +
+  geom_line(aes(x = year, y = TotalVisitors, color = "Observed"), size = 1.5) +
+  geom_line(aes(x = year, y = pred_monthly_agg, color = "Monthly-Aggregated GAM"), linetype = "dashed", size = 1) +
+  geom_line(aes(x = year, y = pred_annual, color = "Annual GAM"), linetype = "dotted", size = 1) +
+  scale_color_manual("", values = c("Observed" = "black", 
+                                    "Monthly-Aggregated GAM" = "tomato", 
+                                    "Annual GAM" = "dodgerblue")) +
+  labs(title = "Model Comparison: Aggregated Monthly GAM vs Annual GAM",
+       y = "Total Annual Visitors", x = "Year") +
+  theme_bw()
+vis_fig[[4]]
 
 # Compile figures
 
 # Historic Visitation
-hf_vis_fig <- ggarrange(vis_fig[[1]], vis_fig[[2]], common.legend = TRUE, align = "hv", legend = "bottom")
-hf_vis_fig
-ggsave(hf_vis_fig, filename = "docs/Deep Dives/CEBR/Figs/hist_fut_vis.tif",
+vis_fig <- ggarrange(vis_fig[[1]], vis_fig[[2]], common.legend = TRUE, align = "hv", legend = "bottom")
+vis_fig
+ggsave(vis_fig, filename = "data/park/CEBR/Figs/hist_fut_vis.tif",
        dpi = 600, width = 7, height = 2.5)
 
 
 # Visitor temp relationships and GAM model
 vis_app <-  ggarrange(vis_fig[[3]], vis_fig[[4]], common.legend = TRUE, align = "hv")
 vis_app 
-ggsave(vis_app, filename = "docs/Deep Dives/CEBR/Figs/historical_visitation_model_appendix.tif",
+ggsave(vis_app, filename = "data/park/CEBR/Figs/historical_visitation_model_appendix.tif",
        dpi = 600, width = 7, height = 2.5)
 
 
@@ -2557,48 +3475,85 @@ ggsave(vis_app, filename = "docs/Deep Dives/CEBR/Figs/historical_visitation_mode
 
  # plot use
 
-low_gal <- past_use_per_visitor * 7.48052
-mid_gal <- use_per_visitor_mean * 7.48052
+cf_to_gal <- 7.48052 # 1cf = 7.48052 gallons
+
+#low_gal <- past_use_per_visitor * cf_to_gal
+#mid_gal <- use_per_visitor_mean * cf_to_gal
 
 use_fig <- list(2)
 #Plot historical visitation
-use_fig[[1]] <- ggplot(monthly_use_proportions) +
-   geom_ribbon(aes(x = month_date, ymin = low_use_hist, ymax = high_use_hist, fill = "Historical"), alpha = 0.3) +
-   geom_line(aes(x = month_date, y = mid_use_hist), color = "black", lineend = "round", lwd = 2) +
-    geom_line(aes(x = month_date, y = mid_use_hist, color = "Historical"), lwd = 1, lineend = "round") +
-   geom_ribbon(aes(x = month_date, ymin = low_use_fut, ymax = high_use_fut, fill = "Projected"), alpha = 0.4) +
-   geom_line(aes(x = month_date, y = mid_use_fut), color = "black", lineend = "round", lwd = 2) +
-    geom_line(aes(x = month_date, y = mid_use_fut, color = "Projected"), lwd = 1, lineend = "round") +
-    # Add an invisible line to create the legend entry
-  #geom_point(aes(x = month_date, y = fut_mean*NA, color = "Historical GAM", fill = "Historical Gam"), pch = 21) +
+
+cols <- c("low_use_hist", "high_use_hist", "mid_use_hist", 
+          "mid_use_fut", "low_use_fut", "high_use_fut")
+
+p_dat <- monthly_use_proportions %>%
+  # Convert to gallons
+  dplyr::mutate(across(all_of(cols), ~ .x * cf_to_gal)) 
+
+use_fig[[1]] <- ggplot(p_dat) +
+   geom_ribbon(aes(x = month_date, 
+                   ymin = low_use_hist, 
+                   ymax = high_use_hist, 
+                   fill = "Historical"), 
+               alpha = 0.3) +
+   geom_line(aes(x = month_date, 
+                 y = mid_use_hist), 
+             color = "black", lineend = "round", lwd = 2) +
+    geom_line(aes(x = month_date, 
+                  y = mid_use_hist, 
+                  color = "Historical"), 
+              lwd = 1, lineend = "round") +
+   geom_ribbon(aes(x = month_date, 
+                   ymin = low_use_fut, 
+                   ymax = high_use_fut, 
+                   fill = "Projected"), alpha = 0.4) +
+   geom_line(aes(x = month_date, y = mid_use_fut), 
+             color = "black", lineend = "round", lwd = 2) +
+    geom_line(aes(x = month_date, y = mid_use_fut, color = "Projected"), 
+              lwd = 1, lineend = "round") +
     theme_bw() +
-   scale_color_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
-  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
+   scale_color_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue)) +
+  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue)) +
   scale_y_continuous(labels = scales::label_number(scale = 1e-3, suffix = "K")) +
-    labs(x = "", y = "Monthly Use (CF)") +
+    labs(x = "", y = "Monthly Use (gal)") +
   scale_x_date(labels = date_format("%b")) +
     theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0)) 
   
+cols <- c("low_use", "high_use", "mid_use")
 
-use_fig[[2]] <- ggplot(annual_use) +
-  geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf), fill = "lightgrey", alpha = 0.3) + 
-  geom_ribbon(aes(x = year, ymin = low_use_fut, ymax = high_use_fut, fill = c_group), alpha = 0.4, lwd = 0) +
-  geom_line(aes(x = year, y = mid_use_fut), color = "black", lwd = 2, lineend = "round") +
-  geom_line(aes(x = year, y = mid_use_fut, color =  c_group, fill = c_group), lwd = 1, lineend = "round") +
-  #geom_line(aes(x = year, y = use_vis_pred), lwd = 2, color = "black", lineend = "round") +
-  #geom_line(aes(x = year, y = use_vis_pred, color = "Historical GAM"), lwd = 1, lineend = "round") +
-  geom_point(aes(x = year, y = mid_use_hist, fill = c_group), color = "black", pch = 21, size = 2) +
+p_dat <- annual_use %>%
+  # Convert to gallons
+  dplyr::mutate(across(all_of(cols), ~ .x * cf_to_gal)) 
+
+use_fig[[2]] <- ggplot(p_dat) +
+  geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf), 
+            fill = "lightgrey", alpha = 0.3) + 
+  geom_ribbon(aes(x = year, ymin = low_use, ymax = high_use, fill = c_group), 
+              alpha = 0.4, lwd = 0) +
+  geom_line(aes(x = year, y = mid_use), 
+            color = "black", lwd = 2, lineend = "round") +
+  geom_line(aes(x = year, y = mid_use, color =  c_group, fill = c_group), 
+            lwd = 1, lineend = "round") +
   theme_bw() +
   scale_y_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
-  scale_color_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
-  scale_fill_manual("", values = c("Projected" = pal$orange, "Historical" = pal$darkblue, "Historical GAM" = "gray")) +
-  labs(x = "", y = "Annual Use (CF)") +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0)) +
+  scale_color_manual("", values = c("Projected" = pal$orange, 
+                                    "Historical" = pal$darkblue)) +
+  scale_fill_manual("", values = c("Projected" = pal$orange, 
+                                   "Historical" = pal$darkblue)) +
+  labs(x = "", y = "Annual Use (gal)") +
+  theme(legend.position = "bottom", 
+        legend.margin = margin(t = -15, b = 0, l = 0, r = 0)) +
    annotate("label", 
-            #x = min(monthly_use_proportions$month_date), 
             x = -Inf,
-            y = Inf, label = "Low = 0.8 gal/visitor\nMid = 3 gal/visitor\nHigh = 5 gal/visitor", 
-    hjust = -.07, vjust = 1.1, fill = "white", color = "black",
+            y = Inf, 
+            label = "Low = 0.83 gal/visitor\nMid = 1.7 gal/visitor\nHigh = 2.5 gal/visitor", 
+            hjust = -.07, 
+            vjust = 1.1, 
+            label.size = 0,             # FORCE thickness to zero
+            label.padding = unit(0.4, "lines"), # Slightly more padding looks cleaner without borders
+            label.r = unit(0, "lines"),
+            fill = "white", 
+            color = "black",
     label.padding = unit(0.1, "lines"), # Add some internal padding
     label.r = unit(0.25, "lines"),      # Optional: Rounded corners
     size = 3#,
@@ -2611,7 +3566,7 @@ use_fig[[2]] <- ggplot(annual_use) +
 # Historic and future water use figure
 hf_use_fig <- ggarrange(use_fig[[1]], use_fig[[2]], common.legend = TRUE, align = "hv", legend = "bottom")
 hf_use_fig
-ggsave(hf_use_fig, filename = "docs/Deep Dives/CEBR/Figs/hist_fut_use.tif",
+ggsave(hf_use_fig, filename = "data/park/CEBR/Figs/hist_fut_use.tif",
        dpi = 600, width = 7, height = 2.5)
 
 
@@ -2897,9 +3852,6 @@ seasonal_stats <- seasonal_stats %>%
 
 
 
-hist_yrs <- c(1979, 2012)
-fut_yrs <- c(2035, 2065)
-
 seasonal_fig <- ggarrange(
   
   ggplot(seasonal_wbm %>% dplyr::filter(y >= hist_yrs[1] & y < hist_yrs[2] | y >= fut_yrs[1] & y < fut_yrs[2])) +
@@ -2943,7 +3895,7 @@ seasonal_fig <- ggarrange(
 
 seasonal_fig
 
-ggsave(seasonal_fig, filename = "docs/Deep Dives/CEBR/Figs/Seasonal.tif",
+ggsave(seasonal_fig, filename = "data/park/CEBR/Figs/Seasonal.tif",
        dpi = 600, width = 7, height = 5)
 ```
 
@@ -2953,6 +3905,7 @@ A plot of the fraction of snowmelt-derived runoff plotted through time across cl
 
 ```{r figure_13}
 
+# Daily Snowmelt Statistics
 snowmelt_stats_d <- wbm %>%
   dplyr::filter(year(date) <= 2012 | year(date) >= 2035, 
                 year(date) < 2065) %>%
@@ -2969,34 +3922,21 @@ snowmelt_stats_d <- wbm %>%
                    snow_frac_precip_min = min(snow_frac_precip, na.rm = TRUE),
                    snow_frac_precip_mean = mean(snow_frac_precip, na.rm = TRUE),
                    snow_frac_precip_max = max(snow_frac_precip, na.rm = TRUE),
-                   snowmelt = mean(melt_in_wbm),
-                   discharge = mean(discharge_gpm)) %>%
+                   snowmelt = mean(melt_in_wbm, na.rm = TRUE),
+                   discharge = mean(discharge_gpm, na.rm = TRUE)) %>%
   group_by(CF) %>%
   dplyr::mutate(snowmelt_mov = data.table::frollmean(snowmelt, 5, align = c("center"), na.rm = TRUE),
                 discharge_mov = data.table::frollmean(discharge, 5, align = c("center"), na.rm = TRUE),
-                doy_date = as.Date(doy, origin = "2019-12-31"))
+                doy_date = as.Date(doy, origin = "2019-12-31")) %>%
+  dplyr::mutate(CF = factor(CF, levels = c("Historical", "Wetter", "Drier")))
 
-
+# Extract Peak Melt
 peak_melt <- snowmelt_stats_d %>%
   slice_max(snowmelt_mov)
 
+# Exctract Peak Discharge
 peak_discharge <- snowmelt_stats_d %>%
   slice_max(discharge_mov)
-
-# Snowmelt timing figure
-sm_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
-  geom_point(aes(y = snowmelt), alpha = 0.3) +
-  geom_line(aes(y = snowmelt_mov, group = CF), linewidth = 2, color = "black", lineend = "round") +
-  geom_line(aes(y = snowmelt_mov), linewidth = 1.5, lineend = "round") +
-  geom_vline(data = peak_melt, aes(color = CF, xintercept = doy_date, linetype = "Peak Melt"), lwd = 1.5, alpha = 0.5) +
-  theme_bw() +
-  scale_color_manual("DOY Mean & \n10-Year \nRolling Mean", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
-  scale_linetype_manual("", values = c(1)) +
-  scale_x_date(date_breaks = "1 month", date_labels = "%b %d") +
-  labs(y = "Mean Daily Snowmelt (in)", x = "") +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
-sm_timing_fig
-
   
 # Snowmelt Fraction Figure
 pdat <- wbm_annual %>%
@@ -3007,7 +3947,8 @@ pdat <- wbm_annual %>%
                               rain_run = (rain_in_wbm / (melt_in_wbm + rain_in_wbm)) * runoff_in_wbm,
                               snow_frac_precip = (precip_in_wbm - rain_in_wbm) / precip_in_wbm,
                               melt_frac = melt_run / (melt_run + rain_run),
-                              rain_frac = rain_run/ (melt_run + rain_run))
+                              rain_frac = rain_run/ (melt_run + rain_run)) %>%
+  dplyr::mutate(CF = factor(CF, levels = c("Historical", "Wetter", "Drier")))
 
 snowmelt_stats <- pdat %>%
  dplyr::filter(year >= hist_yrs[1] & year < hist_yrs[2] | year >= fut_yrs[1] & year < fut_yrs[2]) %>%
@@ -3017,10 +3958,12 @@ snowmelt_stats <- pdat %>%
                    max_frac_mean = max(melt_frac),
                    snow_frac_min = min(snow_frac_precip),
                    snow_frac_mean = mean(snow_frac_precip),
-                   snow_frac_max = max(snow_frac_precip))
+                   snow_frac_max = max(snow_frac_precip)) %>%
+  dplyr::mutate(CF = factor(CF, levels = c("Historical", "Wetter", "Drier")))
 
 view(snowmelt_stats)
 
+# Snowmelt Fraction Figure
 sm_fraction_fig <- ggplot(pdat) +
   # Add shaded region between 2035 and 2065
   geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf), 
@@ -3032,6 +3975,19 @@ sm_fraction_fig <- ggplot(pdat) +
   scale_color_manual("", values = c("Historical" = "#a9a9a9", "Drier" = "#c5312a", "Wetter" = "#85b6dc" )) +
   theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
 
+# Snowmelt timing figure
+sm_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
+  geom_point(aes(y = snowmelt), alpha = 0.3) +
+  geom_line(aes(y = snowmelt_mov, group = CF), linewidth = 2, color = "black", lineend = "round") +
+  geom_line(aes(y = snowmelt_mov), linewidth = 1.5, lineend = "round") +
+  geom_vline(data = peak_melt, aes(color = CF, xintercept = doy_date, linetype = "Peak Melt"), lwd = 1.5, alpha = 0.5) +
+  theme_bw() +
+  scale_color_manual("DOY Mean & \n5-Day \nRolling Mean", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
+  scale_linetype_manual("", values = c(1)) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %d") +
+  labs(y = "Mean Daily Snowmelt (in)", x = "") +
+  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+sm_timing_fig
 
 # Discharge timing figure
 dis_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
@@ -3040,7 +3996,8 @@ dis_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
   geom_line(aes(y = discharge_mov), linewidth = 1.5, lineend = "round") +
   geom_vline(data = peak_discharge, aes(color = CF, xintercept = doy_date, linetype = "Peak Discharge"), lwd = 1.5, alpha = 0.5) +
   theme_bw() +
-  scale_color_manual("DOY Mean & \n10-Year \nRolling Mean", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %d") +
+  scale_color_manual("DOY Mean & \n5-Day \nRolling Mean", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
   scale_linetype_manual("", values = c(1)) +
   labs(y = "Mean Daily Discharge (gpm)", x = "") +
   theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
@@ -3051,7 +4008,7 @@ sm_fig <- ggarrange(sm_fraction_fig, sm_timing_fig, dis_timing_fig, ncol = 1, co
 
 sm_fig
 
-ggsave(sm_fig, filename = "docs/Deep Dives/CEBR/Figs/Snowmelt.tif", 
+ggsave(sm_fig, filename = "data/park/CEBR/Figs/Snowmelt.tif", 
        dpi =  600, 
        units = "in",
        height = 7.5,
@@ -3097,8 +4054,13 @@ ggsave(drought, filename = "docs/Deep Dives/CEBR/Figs/drought.tif",
 
 ```{r}
 
+
 pdat <- monthly_supply_proportions %>% 
-           dplyr::mutate(month_date = ifelse(CF == "Historical", month_date - years(4), month_date + years(50))) %>%
+          #dplyr::mutate(month_date = as.Date(month_date)) %>%
+           dplyr::mutate(month_date = 
+                           as.Date(ifelse(CF == "Historical", 
+                                  month_date - years(4), 
+                                  month_date + years(50)))) %>%
            dplyr::left_join(monthly_use_long, 
                               by = "month_date") %>%
   dplyr::mutate(month_date = as.Date(month_date),
@@ -3167,8 +4129,6 @@ monthly_ds_fig <-  ggplot(pdat2) +
     facet_wrap(~CF, scales = "free_x")
   
 annual_ds_fig <- ggplot(DS_df %>% dplyr::mutate(CF = factor(CF,levels=c("Historical","Drier","Wetter"))), aes(x = year)) +
-   #geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf),
-  #          fill = "grey85", linewidth = 0,  alpha = .1) + 
   geom_ribbon(aes(ymax = DS_stress, ymin = DS, fill = CF), alpha = 0.4) +
   geom_line(aes(y = DS, group = CF), color = "black", linewidth = 2, lineend = "round") +
   geom_line(aes(y = DS, color = CF), linewidth = 1, lineend = "round") +
@@ -3186,42 +4146,132 @@ ds_fig <- ggarrange(monthly_ds_fig, annual_ds_fig, ncol = 1, common.legend = TRU
 
 ds_fig
 
-ggsave(ds_fig, filename = "docs/Deep Dives/CEBR/Figs/ds.tif",
+ggsave(ds_fig, filename = "data/park/CEBR/Figs/ds.tif",
        dpi = 600, width = 7, height = 4)
 
+```
 
+#### Tank Storage
 
-storage_supply_demand_fig <- ggplot(monthly_use %>% 
-         dplyr::mutate(year = year(ym),
-                       CF_label = paste0(CF, " Supply + Storage")) %>%
-         dplyr::filter(year %in% c(2023, 2050, 2070)) %>%
-         dplyr::group_by(CF, year) %>%
-         dplyr::mutate(cume_use = cumsum(monthly_use_mid),
-                       cume_use_low = cumsum(monthly_use_low),
-                       cume_use_high = cumsum(monthly_use_high),
-                       cume_sup = cumsum(discharge_cf)), aes(x = ym)) +
-  geom_ribbon(aes(ymin = cume_use_low, ymax = cume_use_high), alpha = 0.2) +
-  geom_line(aes(y = cume_use), color = "black", lineend = "round", linewidth = 2) +
-  geom_line(aes(y = cume_use, color = "Demand"), lineend = "round", linewidth = 1.5) +
-  geom_line(aes(y = cume_sup + storage_vol, group = CF_label), lineend = "round", linewidth = 2, color = "black") +
-  geom_line(aes(y = cume_sup + storage_vol, color = CF_label), lineend = "round", linewidth = 1.5) +
-  #scale_y_log10() +
-  #geom_line(aes(y = cume_sup + storage_vol, color = CF_label), lineend = "round", linewidth = 1, linetype = "dashed") +
-  scale_y_continuous(labels = scales::label_number(scale = 1e-3, suffix = "K")) +
-  facet_wrap(~year, scales = "free_x") +
-  scale_x_date(labels = date_format("%b")) +
+Track tank storage through time during dry, wet, and average years.
+```{r sup_dem_tank_storage}
+# Define Tank Capacity
+tank_cap_gal <- 153500 
+
+pdat <- monthly_use %>%
+  dplyr::mutate(year = year(ym), 
+                month = month(ym)) %>%
+  drop_na(CF) %>%
+  dplyr::group_by(CF, year, GCM) %>%
+  # 1. Convert all units to Gallons
+  dplyr::mutate(
+    monthly_sup_gal      = discharge_cf * cf_to_gal,
+    monthly_sup_gal_low  = discharge_cf_low * cf_to_gal,
+    monthly_sup_gal_high = discharge_cf_high * cf_to_gal,
+    monthly_use_gal      = monthly_use_mid * cf_to_gal,
+    monthly_use_gal_low  = monthly_use_low * cf_to_gal,
+    monthly_use_gal_high = monthly_use_high * cf_to_gal
+  ) %>%
+  # 2. Triple Storage Simulation Logic
+#  dplyr::group_modify(~ {
+#    
+#    # Helper function to avoid repeating logic
+#    calc_tank <- function(sup_vec, dem_vec) {
+#      purrr::accumulate2(sup_vec, dem_vec, function(current, sup, dem) {
+##        max(0, min(tank_cap_gal, current + sup - dem))
+#      }, .init = tank_cap_gal)[-1]
+#    }
+#    
+#    .x %>% mutate(
+#      tank_storage_gal      = calc_tank(monthly_sup_gal, monthly_use_gal),
+#      tank_storage_gal_low  = calc_tank(monthly_sup_gal_low, monthly_use_gal_high), # Worst Case
+#      tank_storage_gal_high = calc_tank(monthly_sup_gal_high, monthly_use_gal_low)   # Best Case
+#    )
+#  }) %>%
+# Updated Storage Simulation with Deficit Tracking
+dplyr::group_modify(~ {
+  
+  calc_storage_details <- function(sup_vec, dem_vec) {
+    # Initialize a list to hold results
+    res <- purrr::accumulate2(sup_vec, dem_vec, function(prev, sup, dem) {
+      potential_water <- prev$level + sup - dem
+      
+      # Level is constrained between 0 and Capacity
+      actual_level <- max(0, min(tank_cap_gal, potential_water))
+      
+      # Deficit occurs if potential water is negative
+      shortfall <- ifelse(potential_water < 0, abs(potential_water), 0)
+      
+      list(level = actual_level, deficit = shortfall)
+    }, .init = list(level = tank_cap_gal, deficit = 0))[-1]
+    
+    # Flatten the list into a dataframe
+    purrr::map_df(res, ~.)
+  }
+  
+  # Run the simulation for the average scenario
+  avg_res <- calc_storage_details(.x$monthly_sup_gal, .x$monthly_use_gal)
+  
+  # Run for low and high (optional: you could track deficits for these too)
+  low_res  <- calc_storage_details(.x$monthly_sup_gal_low, .x$monthly_use_gal_high)
+  high_res <- calc_storage_details(.x$monthly_sup_gal_high, .x$monthly_use_gal_low)
+  
+  .x %>% mutate(
+    tank_storage_gal      = avg_res$level,
+    deficit_gal           = avg_res$deficit,
+    tank_storage_gal_low  = low_res$level,
+    tank_storage_gal_high = high_res$level
+  )
+}) %>%
+  
+    # 3. Calculate Deficits for the Average scenario
+  dplyr::mutate(
+    deficit_gal = ifelse(tank_storage_gal == 0 & (monthly_sup_gal < monthly_use_gal), 
+                         monthly_use_gal - monthly_sup_gal, 0)
+  ) %>%
+  # 4. Grouping and Summarization
+  dplyr::mutate(plot_group = case_when(
+    year >= 2015 & year < 2025 ~ "Recent Historical (2015-2025)",
+    year >= 2045 & year < 2055 ~ "Future Mid-Century (2045-2055)",
+    year >= 2090 & year < 2100 ~ "Future Late-Century (2090-2100)",
+    TRUE ~ NA)) %>%
+  drop_na(plot_group) %>%
+  dplyr::group_by(month, CF, plot_group) %>%
+  dplyr::summarize(
+    avg_tank_level  = mean(tank_storage_gal, na.rm = TRUE),
+    low_tank_level  = mean(tank_storage_gal_low, na.rm = TRUE),
+    high_tank_level = mean(tank_storage_gal_high, na.rm = TRUE),
+    total_monthly_deficit = mean(deficit_gal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(ym = as.Date(paste0("2020-", month, "-01"))) %>%
+  dplyr::mutate(plot_group = factor(plot_group,
+                                     levels=c("Recent Historical (2015-2025)",
+                                              "Future Mid-Century (2045-2055)",
+                                              "Future Late-Century (2090-2100)")),
+                 CF = factor(CF, levels = c("Historical", "Drier", "Wetter"))) 
+
+track_storage_fig <- ggplot(pdat, aes(x = ym, fill = CF)) +
+  geom_ribbon(aes(ymin = low_tank_level, ymax = high_tank_level), alpha = .3, lwd = 0) +
+  geom_line(aes(y = avg_tank_level), color = "black", lwd = 1.5) +
+  geom_line(aes(y = avg_tank_level, color = CF), lwd = 1) +
+  geom_line(aes(y = -total_monthly_deficit, color = CF), lwd = 1, linetype = "dashed") +
+  facet_wrap(~plot_group) +
+  labs(y = "Tank Level (gallons)", x = "") +
   theme_bw() +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0)) +
-  labs(x = "", y = "Cumulative Supply + Storage\n & Demand (CF)") +
-  scale_color_manual("", values = c("gray80", nps_pal$red, "black", nps_pal$blue, nps_pal$red)) 
+  scale_color_manual("", values = c(nps_pal$grey, nps_pal$red, nps_pal$blue)) +
+  scale_fill_manual("", values = c(nps_pal$grey, nps_pal$red, nps_pal$blue)) +
+  theme(legend.position = "bottom",
+        legend.margin = margin(t = -20, b = 0, l = 0, r = 0))
 
-storage_supply_demand_fig
+track_storage_fig
 
-ggsave(storage_supply_demand_fig, filename = "docs/Deep Dives/CEBR/Figs/stor_sup_dem.tif",
+
+ggsave(track_storage_fig, filename = "data/park/CEBR/Figs/track_storage.tif",
        dpi = 600, width = 7, height = 2.5)
 
-
 ```
+
 
 #### Figure 14a
 
@@ -3238,7 +4288,8 @@ buff_dist <- 1000
 tile_maps <- get_tiles(x = aoi %>% st_buffer(buff_dist), provider =  "Esri.WorldTopoMap", zoom = 13)
 #tile_maps <- get_tiles(x = aoi %>% st_buffer(buff_dist), provider =  "Esri.WorldImagery", zoom = 13)
 
-colfunc <- colorRampPalette(c("lightyellow","orange","red"))
+colfunc <- colorRampPalette(c("#FFF176","orange","tomato"))
+fire_pal <- colfunc(3)
 
 # WHP - Categorical
 figure_14a <- 
@@ -3246,33 +4297,43 @@ figure_14a <-
   tm_rgb() +
   tm_shape(park_boundary) +
   tm_polygons(fill = pal$teal, fill_alpha = 0.2, lwd = 0.5) +
+  
   tm_shape(whp_park_cls) +
   tm_raster("class_short",
-            col.scale = tm_scale(values = c(pal$darkblue, colfunc(6))),
-            col.legend = tm_legend(title = "Wildfire\nHazard Potential", show = TRUE, 
-                                   text.size = .75, title.size = .75, title.fontface = 2, orientation = "portrait"), 
+            col.scale = tm_scale_categorical(
+              values = c("Low" = fire_pal[1], 
+                         "Moderate" = fire_pal[2], 
+                         "High" = fire_pal[3], 
+                         "Non-burnable" = "grey50"),
+              levels = c("Low", "Moderate", "High", "Non-burnable")
+            ),
+            col.legend = tm_legend(
+              title = "Wildfire\nHazard Potential", 
+              show = TRUE, 
+              frame = FALSE,
+              text.size = .75, 
+              title.size = .75, 
+              title.fontface = 2, 
+              orientation = "portrait"
+            ), 
             col_alpha = 0.5) +
+  
   tm_shape(source_table_locs) +
-  tm_dots(fill = pal$black,
-          size = .5,
-          col = "white",
-          lwd = 1,
-          shape = 23) +
-  tm_labels("Blowhard Spring", size = 0.75, remove.overlap = TRUE, bgcol = "white", bgcol_alpha = .5) +
+  tm_dots(fill = pal$black, size = .5, col = "white", lwd = 1, shape = 23) +
+  tm_labels("Blowhard Spring", size = 0.75, remove.overlap = TRUE, bg.color = "white", bg.alpha = .5) +
+  
   tm_shape(recharge_aoi) +
   tm_polygons(fill_alpha = 0) +
-
-  tm_scalebar(position = c(.6, .1), text.size = 0.5) +
-  tm_compass(position  =c(.05, .15), text.size = 0.5) +
+  tm_scalebar(position = c(.3, .1), text.size = 0.5) +
+  tm_compass(position = c(.05, .15), text.size = 0.5) +
   tm_layout(frame = FALSE, 
             legend.frame = FALSE,
-            legend.position = c(1, 1),
-            legend.bg.color = c("white"),
-            legend.bg.alpha = .8)
-
+            legend.position = c(1,1),
+            legend.bg.color = c("white"))
 figure_14a
 
-tmap_save(figure_14a, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Figure_14a.png", width = 6, height = 2.65)
+tmap_save(figure_14a, dpi = 600, filename = "data/park/CEBR/Figs/Figure_14a.jpg", width = 6, height = 2.65)
+
 ```
 
 #### Figure 14b
@@ -3286,8 +4347,14 @@ figure_14b <-
   tm_polygons(fill = pal$teal, fill_alpha = 0.2, lwd = 0.5) +
  # tm_shape(terra::classify(forest_mask, cbind(-Inf, 0, NA), right=TRUE)) +
   tm_shape(nlcd) +
-  tm_raster(col.legend = tm_legend(title = "NLCD Land Cover Class", show = TRUE, 
-                                   text.size = .75, title.size = .75, title.fontface = 2, orientation = "portrait")) +
+  tm_raster(col.legend = tm_legend(
+            title = "NLCD Land Cover Class", 
+            show = TRUE,
+            frame = FALSE,
+            text.size = .75, 
+            title.size = .75, 
+            title.fontface = 2, 
+            orientation = "portrait")) +
   tm_shape(source_table_locs) +
   tm_dots(fill = pal$black,
           size = .5,
@@ -3297,7 +4364,7 @@ figure_14b <-
   tm_labels("Blowhard Spring", size = 0.75, remove.overlap = TRUE,bgcol = "white", bgcol_alpha = .5) +
   tm_shape(recharge_aoi) +
   tm_polygons(fill_alpha = 0) +
-  tm_scalebar(position = c(.6, .1), text.size = 0.5) +
+  tm_scalebar(position = c(.3, .1), text.size = 0.5) +
   tm_compass(position  =c(.05, .15), text.size = 0.5) +
   tm_layout(frame = FALSE, 
             legend.frame = FALSE,
@@ -3307,7 +4374,7 @@ figure_14b <-
 figure_14b
 
 
-tmap_save(figure_14b, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Figure_14b.png", width = 8, height = 2.65)
+tmap_save(figure_14b, dpi = 600, filename = "data/park/CEBR/Figs/Figure_14b.jpg", width = 8, height = 2.65)
 
 # combine all
 #figure_11_all <- tmap_arrange(figure_11a, figure_11b, nrow = 1)
@@ -3448,7 +4515,7 @@ ggplot(pdat, aes(.2*snwd, snowpack_in_wbm)) +
 ```{r figure B7}
 # Historic Fires
 buff_dist <- 5000
-colfunc <- colorRampPalette(c(c(pal$gold, pal$yellow, pal$darkblue, pal$orange, pal$pink, pal$lightpink)))
+colfunc <- colorRampPalette(c(c(pal$yellow, pal$orange, pal$pink, pal$lightpink)))
 
 ## need new tiles for fire extent
 tile_maps_2 <- get_tiles(x = dplyr::summarize(park_new_geomac) %>% st_buffer(buff_dist), 
@@ -3481,7 +4548,7 @@ figure_B7 <-
   tm_labels("Blowhard Spring", size = 0.75, remove.overlap = TRUE, bgcol = "white", bgcol_alpha = .5) +
    tm_shape(recharge_area %>% dplyr::mutate(name = "Recharge Area")) +
   tm_polygons("name",
-              fill.scale = tm_scale(values = c(pal$lightblue)),
+              fill.scale = tm_scale(values = c("navy")),
               fill_alpha = 0.2,
               lwd = 0.5,
               fill.legend = tm_legend(show = TRUE, stack = "vertical", title = "")) +
@@ -3496,7 +4563,7 @@ figure_B7 <-
 figure_B7
 
 
-tmap_save(figure_B7, dpi = 600, filename = "docs/Deep Dives/CEBR/Figs/Historical_Fires.png", width = 9, height = 8)
+tmap_save(figure_B7, dpi = 600, filename = "data/park/CEBR/Figs/Historical_Fires.jpg", width = 9, height = 8)
 
 
 

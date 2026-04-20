@@ -109,7 +109,13 @@ getPODColorado <- function(aoi, dist = 0){
                   waterSource.x, waterSource.y, associatedCaseNumbers.y)) %>%
         dplyr::mutate(park_right = ifelse(grepl("National Park", associatedContacts, ignore.case = T), "Park","Non-park"))
   , silent = TRUE)
+  
+  if (exists("final_wr")) {
+    return_dat <- final_wr
+  } else(
+    return_dat <- nearby_wr
+  )
 
-return(final_wr)
+return(return_dat)
 
 }
