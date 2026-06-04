@@ -150,6 +150,9 @@ source_table_locs <- read_excel(table_path, sheet = 1, na = c("NA", "U"), skip =
     crs    = 4326,
     remove = FALSE
   )
+
+
+
 ```
 
 ### 3. Load Supplementary Datasets
@@ -194,6 +197,8 @@ springs_joined <- springs %>%
   bind_rows(SSI_springs) %>%
   dplyr::mutate(new_name = coalesce(short_name, spring_name)) %>%
   distinct(new_name, .keep_all = TRUE)
+
+
 ```
 
 ##### ---- Watersheds
@@ -266,6 +271,18 @@ mapviewOptions(
   basemaps = c("Esri.WorldTopoMap", "Stadia.StamenTonerLite",
                "CartoDB.PositronOnlyLabels")
 )
+
+# The state database also has well logs. These are manually logged here and
+# presented in the report
+# https://opendata.gis.utah.gov/datasets/utahDNR::utah-well-logs/about
+well_logs <- data.frame(
+  name = c("Test Well Log", "East Rim Well Log"),
+  lat = c(37.607578, 37.634551),
+  lon = c(-112.846386, -112.807030),
+  WIN = c(25797, 25952),
+  WRCHEX = c("73-424", "61-2517")
+)
+
 
 a <-
   mapview(source_table_locs,
@@ -2610,7 +2627,7 @@ site_fig <-
   # 8. Faults
   tm_shape(nps_faults %>% st_transform(3857) %>% dplyr::mutate(name = "Faults")) +
   tm_lines("name", lwd = 2, lty = 2,
-           col.scale = tm_scale_categorical(values = c("gray50")),
+           col.scale = tm_scale_categorical(values = c("gray20")),
            col_alpha = 0.6, col.legend = tm_legend(show = TRUE, title = "")) +
 
   # 9. Springs (Current Supply, Historical Supply, Other)
@@ -2628,6 +2645,12 @@ site_fig <-
   tm_labels("new_lab", size = 0.7, ymod = 0, xmod = 0,
             bg.color = "white", bg.alpha = 0.7, fontface = "bold", col = "black") +
 
+  tm_shape(well_logs) + 
+  tm_dots(fill = "gray",
+          shape = 23,
+          size = 0.75,
+          
+  
   # 10. Map Elements
   tm_scalebar(position = c("right", "bottom"), text.size = 0.6) +
   tm_compass(position = c("left", "top"), size = 1.5) +
