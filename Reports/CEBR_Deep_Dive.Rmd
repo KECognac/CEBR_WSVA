@@ -150,6 +150,9 @@ source_table_locs <- read_excel(table_path, sheet = 1, na = c("NA", "U"), skip =
     crs    = 4326,
     remove = FALSE
   )
+
+
+
 ```
 
 ### 3. Load Supplementary Datasets
@@ -194,6 +197,15 @@ springs_joined <- springs %>%
   bind_rows(SSI_springs) %>%
   dplyr::mutate(new_name = coalesce(short_name, spring_name)) %>%
   distinct(new_name, .keep_all = TRUE)
+
+# ---5. Test well coordinates - from Utah state well log map viewer
+# https://www.waterrights.utah.gov/wellinfo/welldrilling/wlbrowse.asp?WIN=25797
+test_well <- data.frame(
+  "lat" = c(37.607512311),
+  "lon" = c(-112.84647946)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+
 ```
 
 ##### ---- Watersheds
@@ -221,7 +233,7 @@ park_flowlines <- park_boundary %>%
   mapNHDPlusHR()
 
 # --- 3. Visualization ---
-mapview(all_watersheds, col.regions = "seagreen") +
+mapview(watersheds, col.regions = "seagreen") +
   mapview(
     park_flowlines %>% dplyr::filter(FCode == 46006),
     color      = "steelblue",
@@ -266,6 +278,19 @@ mapviewOptions(
   basemaps = c("Esri.WorldTopoMap", "Stadia.StamenTonerLite",
                "CartoDB.PositronOnlyLabels")
 )
+
+# The state database also has well logs. These are manually logged here and
+# presented in the report
+# https://opendata.gis.utah.gov/datasets/utahDNR::utah-well-logs/about
+well_logs <- data.frame(
+  name = c("Test Well Log", "East Rim Well Log"),
+  lat = c(37.607578, 37.634551),
+  lon = c(-112.846386, -112.807030),
+  WIN = c(25797, 25952),
+  WRCHEX = c("73-424", "61-2517")
+) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
 
 a <-
   mapview(source_table_locs,
@@ -442,6 +467,11 @@ blowhard_mtn_an <- blowhard_mtn_d %>%
 # --- 6. Summary and Visualization ---
 print(summary(blowhard_mtn_d))
 
+# Blowhard Station
+
+blowhard_station <- stations %>%
+  dplyr::filter(name == "BLOWHARD MTN RADAR")
+
 # Nearby comparison stations
 select_station_list <- c("BLOWHARD MTN RADAR", "CEDAR BREAKS NM",
                          "CEDAR BREAKS STORAGE", "LOWDER RANGER STATION")
@@ -570,6 +600,7 @@ Springflow observations provided directly by the park.
 blowhard_spr <- read_csv("data/park/CEBR/from_NPS/spring_flow.csv") %>%
   dplyr::mutate(
     date = mdy(date),
+    flow_cfs = 0.0022280092365745 * flow_gpm,
     ym   = lubridate::ym(substr(date, 1, 7))
   )
 ```
@@ -1066,7 +1097,8 @@ hist_wbm <- run_NPS_WBM_points(
   aoi             = recharge_aoi,
   grid            = aoi_gridmet_grid,
   ret_final_cond  = TRUE,
-  use_final       = FALSE
+  use_final       = FALSE,
+  aggregate = TRUE
 )
 
 # --- 2. Future WBM Run (MACA GCMs, 2025–2100) ---
@@ -1109,7 +1141,10 @@ wbm_all <- hist_wbm %>%
   bind_rows(fut_wbm) %>%
   as.data.table() %>%
   left_join(all_cfs, by = "GCM") %>%
-  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400)
+  dplyr::mutate(
+    #  CFS calculation
+    runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400,
+)
 
 # --- 2. Compute 30-Year Period Statistics for GCM Selection ---
 all_clim_stats <- wbm_all %>%
@@ -1209,6 +1244,8 @@ ggsave(selected_gcms[[2]],
 
 ```{r subset_wbm}
 # --- 1. Subset WBM to Selected Climate Futures ---
+scale_factor <- 0.015
+
 # Historical period is assigned to all GCMs prior to 2024
 wbm <- wbm_all %>%
   dplyr::left_join(selected_cfs %>% dplyr::select(CF, GCM), by = "GCM") %>%
@@ -1217,8 +1254,9 @@ wbm <- wbm_all %>%
   # Convert temperature and add runoff in volume units
   dplyr::mutate(
     tmean_F    = (9/5 * tmean_C) + 32,
-    runoff_cf  = (runoff_in_wbm / 12) * recharge_area_ft2 * 0.015,
-    runoff_gpm = runoff_cf * cf_to_gal / (60 * 24)
+    runoff_cf  = (runoff_in_wbm / 12) * recharge_area_ft2 * scale_factor,
+    runoff_gal = runoff_cf * cf_to_gal,
+    runoff_gpm = runoff_gal / (60 * 24)
   )
 
 setorder(wbm, date)
@@ -2438,6 +2476,7 @@ watersheds, and road network.
 ```{r figure_2}
 # --- 1. Prepare Spatial Layers ---
 
+
 # Basemap extents
 fig_aoi_wide <- park_boundary %>%
   st_buffer(12000) %>%
@@ -2455,64 +2494,8 @@ fig_aoi <- park_boundary %>%
   st_as_sf() %>%
   st_transform(4326)
 
-# Infrastructure
-buildings <- getBuildings(park_boundary)
 
-# Roads from OpenStreetMap (major and primary only)
-roads <- opq(bbox = st_bbox(fig_aoi_wide)) %>%
-  add_osm_feature(key = "highway") %>%
-  osmdata_sf()
-
-roads <- roads$osm_lines %>%
-  mutate(road_type = case_when(
-    highway %in% c("motorway", "trunk", "primary")    ~ "Major Highway",
-    highway %in% c("secondary", "tertiary")           ~ "Primary Road",
-    TRUE                                              ~ "Local/Minor"
-  )) %>%
-  filter(road_type != "Local/Minor")
-
-# Natural features (peaks, cliffs, etc.)
-places <- opq(bbox = st_bbox(fig_aoi)) %>%
-  add_osm_feature(key = "natural",
-                  value = c("peak", "volcano", "saddle", "cliff", "bare_rock")) %>%
-  osmdata_sf()
-
-# Keep only named nodes
-#place_points <- places$osm_points %>%
-#  filter(!is.na(name)) %>%
-#  st_transform(3857)
-
-# Park/forest polygons (optional context)
-#park_forests <- opq(bbox = st_bbox(fig_aoi)) %>%
-#  add_osm_feature(key = "leisure",  value = "park") %>%
-#  add_osm_feature(key = "boundary", value = "national_park") %>%
-#  add_osm_feature(key = "landuse",  value = "forest") %>%
-#  osmdata_sf()
-
-# Trails
-#trails <- opq(bbox = st_bbox(fig_aoi)) %>%
-#  add_osm_feature(key = "highway", value = "path") %>%
-#  add_osm_feature(key = "route",   value = "hiking") %>%
-#  osmdata_sf()
-
-# Basemap tiles
-tile_maps <- get_tiles(
-  x        = fig_aoi,
-  provider = "CartoDB.PositronOnlyLabels",
-  zoom     = 13,
-  project  = FALSE
-)
-tile_maps_wide <- get_tiles(
-  x        = fig_aoi_wide,
-  provider = "Esri.NatGeoWorldMap",
-  zoom     = 11,
-  project  = FALSE
-)
-
-# Elevation raster
-elev_ras <- elevatr::get_elev_raster(locations = fig_aoi, z = 14)
-
-# Springs consolidated layer (exclude supply springs; add labeled supply springs separately)
+# Join springs
 springs_join <- springs_joined %>%
   dplyr::filter(
     !new_name %in% c("Blowhard Spring", "Shooting Star Spring",
@@ -2528,105 +2511,272 @@ springs_join <- springs_joined %>%
       dplyr::filter(location %in% c("Blowhard Spring", "Shooting Star Spring",
                                     "Twin Spring", "Twin Springs")) %>%
       dplyr::mutate(
-        new_lab = gsub(" Spring", "", location),
-        Springs = ifelse(location == "Blowhard Spring", "Current Supply", "Historical Supply")
+        # Only label Blowhard on main map; historical supplies labeled in inset
+        new_lab = ifelse(location == "Blowhard Spring", "Blowhard Spring", ""),
+        Springs = ifelse(location == "Blowhard Spring", 
+                        "Current Supply", "Historical Supply")
       ) %>%
-      dplyr::select(Springs, new_lab)
+      dplyr::select(Springs, new_lab, location)
   )
+
+
+# Inset AOI - bounding box around the springs area
+# Adjust these coordinates to frame your springs cluster appropriately
+springs_aoi <- springs_join %>%
+  dplyr::filter(Springs %in% c("Current Supply", "Historical Supply")) %>%
+  st_buffer(250) %>%
+  st_transform(4326) %>%
+  st_bbox() %>%
+  st_as_sfc() %>%
+  st_as_sf() %>%
+  st_transform(st_crs(fig_aoi))
+
+# Infrastructure
+buildings <- getBuildings(park_boundary)
+
+# Elevation raster
+elev_ras <- elevatr::get_elev_raster(locations = fig_aoi, z = 14)
+
+
+# Combine well logs and weather station into a single sf object
+monitoring_sites <- bind_rows(
+  well_logs %>% 
+    dplyr::filter(name == "Test Well Log") %>%
+    st_transform(3857) %>% 
+    mutate(site_type = "Test Well"),
+  blowhard_station %>% 
+    st_transform(3857) %>% 
+    mutate(site_type = "Blowhard Mtn. Rad. Weather station")
+) %>%
+  bind_rows(
+    buildings %>%
+      filter(BLDGNAME == "Visitor Center") %>%
+      st_centroid() %>%
+      st_transform(3857) %>%
+      mutate(site_type = "Visitor Center")
+  )
+
+
 ```
 
-```{r site_figure}
-site_fig <-
-  # 1. Elevation hillshade base
-  tm_shape(elev_ras, bbox = fig_aoi) +
-  tm_raster(
-    col.scale = tm_scale_continuous(values = hcl.colors(5, pal = "Earth"), n = 2),
-    col_alpha  = 1,
-    col.legend = tm_legend(title = "Elevation (m)", reverse = TRUE, orientation = "landscape")
-  ) +
 
-  # 2. Roads
-  tm_shape(roads) +
-  tm_lines(col = "white", lwd = "road_type",
-           lwd.scale = tm_scale_categorical(values = c(4, 2)),
-           lwd.legend = tm_legend(show = FALSE)) +
-  tm_shape(roads) +
-  tm_lines(col = "road_type",
-           col.scale = tm_scale_categorical(values = c("gray50", "gray80")),
-           lwd = "road_type",
-           lwd.scale = tm_scale_categorical(values = c(2.5, 1)),
-           lwd.legend = tm_legend(show = FALSE),
-           col.legend = tm_legend(show = FALSE)) +
 
-  # 3. Recharge Area
-  tm_shape(recharge_area %>% st_transform(3857) %>%
-             dplyr::mutate(name = "Blowhard Recharge Area")) +
+```{r springs_inset}
+springs_inset <-
+  # 1. Basemap
+  tm_basemap("Esri.WorldTopoMap", zoom = 15) +
+
+  # 2. Recharge Area
+  tm_shape(recharge_area %>%
+             st_transform(3857) %>%
+             mutate(name = "Blowhard Recharge Area"),
+           bbox = springs_aoi) +
   tm_polygons(fill = "name",
-              fill.scale = tm_scale_categorical(values = c("dodgerblue")),
-              fill_alpha = 0.2, col = "dodgerblue4", lwd = 1.5, lty = "solid",
+              fill.scale = tm_scale_categorical(values = c("goldenrod")),
+              fill_alpha = 0.1,
+              col = "goldenrod",
+              lwd = 2,
+              lty = "solid",
+              fill.legend = tm_legend(title = "", show = FALSE)) +
+
+  # 4. Park Boundary
+  tm_shape(park_boundary %>%
+             mutate(name = "Park boundary"),
+           bbox = springs_aoi) +
+  tm_polygons(col = "name",
+              col.scale = tm_scale_categorical(values = c("Park boundary" = "seagreen")),
+              fill_alpha = 0, lwd = 2,
+              col.legend = tm_legend(title = "", show = FALSE)) +
+
+  # 5. Faults
+  tm_shape(nps_faults %>%
+             st_transform(3857) %>%
+             mutate(name = "Faults"),
+           bbox = springs_aoi) +
+  tm_lines("name", lwd = 1.5, lty = 1,
+           col.scale = tm_scale_categorical(values = c("gray10")),
+           col_alpha = 1,
+           col.legend = tm_legend(show = FALSE, title = "")) +
+
+  
+  # 6. Springs (Current Supply + Historical Supply only, all labeled)
+  tm_shape(springs_join %>%
+             filter(Springs %in% c("Current Supply", "Historical Supply")) %>%
+             mutate(new_lab = case_when(
+               new_lab == "" ~ gsub(" Spring", "", 
+                                    as.character(Springs)),
+               TRUE ~ new_lab
+             )),
+           bbox = springs_aoi) +
+  tm_dots(fill = "hotpink", 
+          shape = "Springs",
+          shape.scale = tm_scale_categorical(values = c(23, 22)),
+          col = "black", lwd = 0.5,
+          size = .7,
+          shape.legend      = tm_legend(title = "Springs"),
+          fill_alpha.legend = tm_legend(show = FALSE),
+          size.legend       = tm_legend(show = FALSE)) +
+  tm_text("location", size = 0.75, col = "black", fontface = "bold",
+          bgcol = "white", bgcol_alpha = 0.7,
+          xmod = 0,
+          ymod = 2,
+          options = opt_tm_text(remove_overlap = TRUE, 
+                                just = "center")) +
+
+    # 8. Points of Interest (test well, weather station, visitor center)
+  tm_shape(monitoring_sites %>%
+             filter(site_type == "Test Well"), bbox = fig_aoi) +
+  tm_dots(fill = "site_type",
+          fill.scale = tm_scale_categorical(values = c(
+            "Test Well"                          = "gray60",
+            "Blowhard Mtn. Rad. Weather station" = "navy",
+            "Visitor Center"                     = "seagreen"
+          )),
+          shape = "site_type",
+          shape.scale = tm_scale_categorical(values = c(
+            "Test Well"                          = 22,
+            "Blowhard Mtn. Rad. Weather station" = 22,
+            "Visitor Center"                     = 22
+          )),
+          size = .7,
+          col = "black",
+          lwd = 0.5,
+          fill.legend  = tm_legend(title = ""),
+          shape.legend = tm_legend(show = FALSE)) +
+  
+  tm_layout(
+    legend.show   = FALSE,
+    frame         = TRUE,
+    frame.color = "red",
+    frame.lwd = 2,
+    outer.margins = c(0, 0, 0, 0),
+    inner.margins = c(0.0, 0.0, 0.0, 0.0)
+  )
+  
+springs_inset
+
+```
+
+
+```{r site_figure}
+
+site_fig <-
+  # 1. Basemap
+  tm_basemap("Esri.WorldTopoMap", zoom = 13) +
+
+  # 2. Recharge Area
+  tm_shape(recharge_area %>% 
+             st_transform(3857) %>%
+             mutate(name = "Blowhard Recharge Area"),
+           bbox = fig_aoi) +
+  tm_polygons(fill = "name",
+              fill.scale = tm_scale_categorical(values = c("goldenrod")),
+              fill_alpha = 0.25, 
+              col = "goldenrod4", 
+              lwd = 2, 
+              lty = "solid",
               fill.legend = tm_legend(title = "", show = TRUE)) +
 
-  # 4. HUC-10 Watersheds
+  # 3. HUC-10 Watersheds (gray, solid, labeled on map)
   tm_shape(watersheds %>%
-             dplyr::mutate(other_name = "Watersheds") %>%
              st_transform(st_crs(fig_aoi)) %>%
              st_intersection(fig_aoi %>% st_buffer(100)) %>%
-             dplyr::mutate(name = case_when(
+             mutate(name = case_when(
                name == "Jack Rabbit Wash-Rush Lake" ~ "Ashdown / Coal Creek",
                name == "Asay Creek"                ~ "Midway Valley-Midway Creek",
                TRUE                                ~ name
-             ))) +
-  tm_polygons(col = "other_name",
-              col.scale = tm_scale_categorical(values = "dodgerblue4"),
-              fill_alpha = 0, lty = "dotted", lwd = 2,
-              col.legend = tm_legend(title = "")) +
-  tm_text("name", size = 0.8, col = "dodgerblue4", ymod = 2, fontface = "bold",
-          options = opt_tm_text(just = "center", shadow = FALSE)) +
+             )),
+           bbox = fig_aoi) +
+  tm_polygons(col = "name",
+              col.scale = tm_scale_categorical(values = c(
+                "Ashdown / Coal Creek"       = "brown",
+                "Midway Valley-Midway Creek" = "brown",
+                "Mammoth Creek"              = "brown"
+              )),
+              fill_alpha = 0, lty = "solid", lwd = 1.5,
+              col.legend = tm_legend(show = FALSE)) +
+  tm_text("name", size = 0.7, col = "brown", fontface = "italic",
+          bgcol = "white", bgcol_alpha = 0.6, ymod = -4, xmod = -2,
+          options = opt_tm_text(remove_overlap = TRUE, just = "center")) +
 
-  # 5. Stream Network (perennial and intermittent)
+  # 4. Stream Network
   tm_shape(park_flowlines %>%
              st_transform(4326) %>%
-             dplyr::filter(FCode %in% c(46005, 46006)) %>%
+             filter(FCode %in% c(46005, 46006)) %>%
              st_intersection(fig_aoi) %>%
              st_transform(3857) %>%
-             dplyr::group_by(GNIS_Name) %>%
-             dplyr::summarize() %>%
-             dplyr::mutate(GNIS_Name = ifelse(GNIS_Name == "Unknown", "", GNIS_Name))) +
+             group_by(GNIS_Name) %>%
+             summarize() %>%
+             mutate(GNIS_Name = ifelse(GNIS_Name == "Unknown", "", GNIS_Name)),
+           bbox = fig_aoi) +
   tm_lines(lwd = 0.8, col = "dodgerblue") +
 
-  # 6. Named Geographic Features
-  tm_shape(places$osm_points %>% st_transform(3857) %>% filter(!is.na(name))) +
-  tm_symbols(shape = 24, col_alpha = 1, fill_alpha = 0,
-             size = 0.5, fill = "white", col = "white") +
-  tm_text("name", size = 0.8, col = "white", fontface = "italic", xmod = -0.4,
-          options = opt_tm_text(shadow = FALSE, just = "right", remove_overlap = TRUE)) +
+  # 5. Park Boundary (legend entry only, no map label)
+  tm_shape(park_boundary %>%
+             mutate(name = "Park boundary"),
+           bbox = fig_aoi) +
+  tm_polygons(col = "name",
+              col.scale = tm_scale_categorical(values = c("Park boundary" = "seagreen")),
+              fill_alpha = 0, lwd = 2,
+              col.legend = tm_legend(title = "", show = TRUE)) +
 
-  # 7. Park Boundary
-  tm_shape(park_boundary %>% dplyr::mutate(lab = "Cedar Breaks\nNational Monument")) +
-  tm_polygons(fill_alpha = 0, lwd = 2, col = "seagreen") +
-  tm_labels("lab", size = 0.9, ymod = 4, xmod = 1, col = "seagreen",
-            bg.color = "white", bg.alpha = 0.7, fontface = "bold") +
+  # 6. Faults
+  tm_shape(nps_faults %>% 
+             st_transform(3857) %>% 
+             mutate(name = "Faults"),
+           bbox = fig_aoi) +
+  tm_lines("name", lwd = 1.5, lty = 1,
+           col.scale = tm_scale_categorical(values = c("gray10")),
+           col_alpha = 1,
+           col.legend = tm_legend(show = TRUE, title = "")) +
 
-  # 8. Faults
-  tm_shape(nps_faults %>% st_transform(3857) %>% dplyr::mutate(name = "Faults")) +
-  tm_lines("name", lwd = 2, lty = 2,
-           col.scale = tm_scale_categorical(values = c("gray50")),
-           col_alpha = 0.6, col.legend = tm_legend(show = TRUE, title = "")) +
-
-  # 9. Springs (Current Supply, Historical Supply, Other)
-  tm_shape(springs_join) +
+  # 7. Springs (labeled where new_lab is non-empty)
+  tm_shape(springs_join, bbox = fig_aoi) +
   tm_dots(fill = "hotpink", shape = "Springs",
           shape.scale = tm_scale_categorical(values = c(23, 22, 21)),
           fill_alpha = "Springs",
           fill_alpha.scale = tm_scale_categorical(values = c(1, 1, 0.4)),
           size = "Springs",
-          size.scale  = tm_scale_categorical(values = c(0.75, 0.5, 0.5)),
+          size.scale = tm_scale_categorical(values = c(0.6, 0.45, 0.45)),
           col = "black", lwd = 0.5,
           shape.legend      = tm_legend(title = "Springs"),
           fill_alpha.legend = tm_legend(show = FALSE),
           size.legend       = tm_legend(show = FALSE)) +
-  tm_labels("new_lab", size = 0.7, ymod = 0, xmod = 0,
-            bg.color = "white", bg.alpha = 0.7, fontface = "bold", col = "black") +
+  tm_shape(springs_join %>% filter(new_lab != ""), bbox = fig_aoi) +
+  tm_text("new_lab", size = 0.65, col = "black", fontface = "bold",
+          bgcol = "white", bgcol_alpha = 0.7,
+          xmod = 0.5,
+          options = opt_tm_text(remove_overlap = TRUE, just = "left")) +
+
+  # 8. Points of Interest (test well, weather station, visitor center)
+  tm_shape(monitoring_sites, bbox = fig_aoi) +
+  tm_dots(fill = "site_type",
+          fill.scale = tm_scale_categorical(values = c(
+            "Test Well"                          = "gray40",
+            "Blowhard Mtn. Rad. Weather station" = "navy",
+            "Visitor Center"                     = "seagreen"
+          )),
+          shape = "site_type",
+          shape.scale = tm_scale_categorical(values = c(
+            "Test Well"                          = 22,
+            "Blowhard Mtn. Rad. Weather station" = 22,
+            "Visitor Center"                     = 22
+          )),
+          size = 0.5,
+          col = "black",
+          lwd = 0.5,
+          fill.legend  = tm_legend(title = ""),
+          shape.legend = tm_legend(show = FALSE)) +
+  
+  # 9. Springs inset embedded as tmap object
+  tm_inset(
+    springs_inset,
+    position = c(0.475, 1.055),
+    width = 20,
+    height = 14,
+    box_frame.color = "red",
+    main_frame.color = "red"
+  ) +
 
   # 10. Map Elements
   tm_scalebar(position = c("right", "bottom"), text.size = 0.6) +
@@ -2645,12 +2795,161 @@ site_fig <-
     legend.text.size        = 0.8
   )
 
+
+
 site_fig
+
 tmap_save(site_fig, dpi = 600,
           filename = "data/park/CEBR/Figs/Site_fig.jpg", width = 7, height = 9)
 ```
 
-#### Watersheds Figure
+##### ---- Nearby Streams Discharge Figure
+
+```{r nearby_streams}
+
+# 1. Define standard water year breaks and labels
+wy_breaks <- c(1, 32, 62, 93, 124, 152, 183, 213, 244, 274, 305, 336)
+wy_labels <- c("Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep")
+
+# 2. SET SCALING FACTOR 
+scale_factor <- 3
+yr <- 2000
+
+
+# 3. Prepare the datasets
+df_discharge <- nwis_select_discharge %>%
+  dplyr::mutate(
+    wy_start = if_else(month(date) >= 10, 
+                       as.Date(paste0(year(date), "-10-01")), 
+                       as.Date(paste0(year(date) - 1, "-10-01"))),
+    doy = as.numeric(date - wy_start) + 1,
+    group = case_when(year(date) < yr ~ paste0("Pre-", as.character(yr)),
+                      year(date) >= yr ~ paste0("Post-", as.character(yr))),
+    site_name = case_when(
+      grepl("COAL", site_name) ~ "Coal Creek",
+      grepl("MAMMOTH", site_name) ~ "Mammoth Creek")
+  ) %>%
+  group_by(site_name, doy, group) %>%
+  dplyr::summarize(discharge = mean(discharge), .groups = "drop")
+
+df_snow <- blowhard_mtn_d %>%
+  dplyr::filter(year(date) > 1979) %>%
+  st_drop_geometry() %>%
+  dplyr::mutate(
+    wy_start = if_else(month(date) >= 10, 
+                       as.Date(paste0(year(date), "-10-01")), 
+                       as.Date(paste0(year(date) - 1, "-10-01"))),
+    doy = as.numeric(date - wy_start) + 1,
+    group = case_when(year(date) < yr ~ paste0("Pre-", as.character(yr)),
+                      year(date) >= yr ~ paste0("Post-", as.character(yr))),
+  ) %>%
+  dplyr::group_by(doy, group) %>%
+  dplyr::summarize(snwd = mean(snwd, na.rm = TRUE), .groups = "drop")
+
+# 4. Generate the Dual-Axis Plot (Color-Differentiated with Outlines)
+ggplot() +
+
+  # --- SNOW LAYERS ---
+  # 3. Background Outline for Snow
+  #geom_line(data = df_snow, 
+  #          aes(x = doy, y = snwd * scale_factor, 
+  #              group = group),
+  #          alpha = 0.5,
+  #          color = "black", linewidth = 2.0, lineend = "round") +
+  # 4. Core Colored Line for Snow
+  geom_line(data = df_snow, 
+            aes(x = doy, y = snwd * scale_factor, 
+                color = interaction("Blowhard Mtn. Rad.", group, sep = " ")), 
+            alpha = 0.5,
+            linewidth = 1.5, lineend = "round") +
+  
+  
+    # --- DISCHARGE LAYERS ---
+  # 1. Background Outline for Discharge
+  geom_line(data = df_discharge, 
+            aes(x = doy, y = discharge, 
+                group = interaction(site_name, group)),
+            color = "black", linewidth = 2.0, lineend = "round") +
+  # 2. Core Colored Line for Discharge
+  geom_line(data = df_discharge, 
+            aes(x = doy, y = discharge, 
+                color = interaction(site_name, group, sep = " ")), 
+            linewidth = 1.5, lineend = "round") +
+  
+  
+  
+  # Axis Scaling
+  scale_x_continuous(breaks = wy_breaks, labels = wy_labels) + 
+  scale_y_continuous(
+    name = "Mean Daily Discharge (cfs)",
+    sec.axis = sec_axis(~ . / scale_factor, name = "Snow Depth (in)") 
+  ) +
+  
+  # Cohesive Color Palette (Paired Shades)
+  scale_color_manual(
+    "", 
+    values = c(
+      # Coal Creek (Blues)
+      "Coal Creek Pre-2000"          = pal$lightblue, # Light Blue
+      "Coal Creek Post-2000"         = pal$darkblue, # Dark Blue
+      
+      # Mammoth Creek (Pinks)
+      "Mammoth Creek Pre-2000"       = pal$lightpink, # Light Pink
+      "Mammoth Creek Post-2000"      = pal$pink, # Deep Pink
+      
+      # Snow Depth (Grays)
+      "Blowhard Mtn. Rad. Pre-2000"  = "#cccccc", # Light Gray
+      "Blowhard Mtn. Rad. Post-2000" = "#525252"  # Dark Charcoal
+    )
+  ) +
+  labs(x = "") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.text = element_text(size = 9),
+    legend.margin = margin(t = -20, b = 0, l = 0, r = 0)
+  )
+
+ggsave(filename = "data/park/CEBR/Figs/Streamflow_Changes.jpg", dpi = 600, width = 7, height = 3)
+
+
+# Also calculate days change
+
+# 1. Calculate Peak Day for Discharge
+peak_discharge <- df_discharge %>%
+  group_by(site_name, group) %>%
+  # Find the DOY corresponding to the maximum mean discharge
+  filter(discharge == max(discharge, na.rm = TRUE)) %>%
+  select(site_name, group, peak_doy_discharge = doy) %>%
+  distinct() %>% # Handle ties if multiple days have the exact same peak
+  tidyr::pivot_wider(names_from = group, values_from = peak_doy_discharge) %>%
+  mutate(days_earlier_discharge = `Pre-2000` - `Post-2000`)
+
+# 2. Calculate Peak Day for Snow Depth
+peak_snow <- df_snow %>%
+  group_by(group) %>%
+  # Find the DOY corresponding to the maximum mean snow depth
+  filter(snwd == max(snwd, na.rm = TRUE)) %>%
+  select(group, peak_doy_snow = doy) %>%
+  distinct() %>% 
+  tidyr::pivot_wider(names_from = group, values_from = peak_doy_snow) %>%
+  mutate(
+    site_name = "Blowhard Mtn. Rad.",
+    days_earlier_snow = `Pre-2000` - `Post-2000`
+  )
+
+# 3. Print Results
+print("--- Discharge Peak Shifts ---")
+print(peak_discharge)
+
+print("--- Snow Depth Peak Shifts ---")
+print(peak_snow)
+
+```
+
+
+##### ---- Watersheds Figure
 
 ```{r watersheds_figure}
 watersheds_figure <-
@@ -2686,7 +2985,7 @@ watersheds_figure <-
 watersheds_figure
 ```
 
-#### Geology Figure
+##### ---- Geology Figure
 
 ```{r geo_figure}
 geo_figure <-
@@ -2769,7 +3068,7 @@ rch_map <- tm_shape(recharge_area %>%
     xmod = -8.3, fontface = 3, col = pal$darkblue)
 ```
 
-#### Runoff Routing Model Figure
+##### ---- Runoff Routing Model Figure
 
 ```{r runoff_routing_model_fig}
 # Recompute springflow_plot bounds for the report figure
@@ -2800,7 +3099,44 @@ ggsave(flow_mod_fig,
        width = 7, height = 2.5, dpi = 600)
 ```
 
-#### Water Budget Figure
+```{r general_BHspring_plot}
+
+## Second spring flow figure -  showing flow vs snow
+
+flow_dat_fig <- ggplot(springflow_plot, aes(x = date)) +
+  geom_rect(aes(xmin = as.Date("1983-01-01"), xmax = as.Date("1984-01-01"),
+                ymin = -Inf, ymax = Inf),
+            fill = "grey85", linewidth = 0, alpha = 0.1) +
+  #geom_line(data = blowhard_mtn_m, aes(x = ym, y = prcp), 
+  #          linewidth = 1.75, lineend = "round", color = "black") +
+  #geom_line(data = blowhard_mtn_m, aes(x = ym, y = prcp, color = "Precip."), 
+  #          linewidth = 1.5, lineend = "round") +
+   geom_line(data = blowhard_mtn_m, aes(x = ym, y = snwd), 
+            color = "black", linewidth = 1.75, lineend = "round") +
+  geom_line(data = blowhard_mtn_m, aes(x = ym, y = snwd, color = "Snow Depth"), 
+            linewidth = 1.5, lineend = "round") +
+  geom_point(aes(y = flow_gpm, color = "Observed"), 
+             size = 2, shape = 21, fill = pal$darkblue) +
+  scale_y_continuous(
+    name = "Flow (gpm)",
+    sec.axis = sec_axis(~ . * 1, name = "Snow Depth (in)")
+  ) +
+  theme_bw() +
+  scale_x_date(limits = c(min(springflow_plot$date), max(springflow_plot$date))) +
+  scale_color_manual("", values = c("Precip." = pal$lightblue, 
+                                    "Snow Depth" = "gray45", 
+                                    "Observed" = "black")) +
+  labs(x = "") +
+  theme(legend.position = "bottom",
+        legend.margin = margin(t = -20, b = 0, l = 0, r = 0))
+
+ggsave(flow_dat_fig,
+       filename = "data/park/CEBR/Figs/Blowhard_Flow_dat.tiff",
+       width = 7, height = 2.5, dpi = 600)
+
+```
+
+##### ---- Water Budget Figure
 
 Historical and projected annual water budget components for the recharge area,
 shown with a 10-year rolling average.
@@ -2857,7 +3193,7 @@ ggsave(wb_fig,
        width = 9, height = 5, dpi = 600)
 ```
 
-#### Visitation Figure
+##### ---- Visitation Figure
 
 ```{r vis_plot}
 # --- 1. Monthly Historical vs. Projected Visitation ---
@@ -2960,7 +3296,7 @@ ggsave(vis_app,
        dpi = 600, width = 7, height = 2.5)
 ```
 
-#### Water Use Figure
+##### ---- Water Use Figure
 
 ```{r water_use_fig}
 # --- 1. Monthly Use: Historical vs. Projected ---
@@ -3032,7 +3368,7 @@ ggsave(hf_use_fig,
        dpi = 600, width = 7, height = 2.5)
 ```
 
-#### Annual Runoff Variability Figure
+##### ---- Annual Runoff Variability Figure
 
 Bar plot showing annual runoff for each climate future relative to the
 historical 10th and 90th percentile bounds.
@@ -3041,7 +3377,7 @@ historical 10th and 90th percentile bounds.
 # --- 1. Prepare Data and Historical Reference Lines ---
 pdat <- wbm_annual %>%
   dplyr::filter(year < 2100) %>%
-  dplyr::mutate(Runoff = 86400 * 365.25 * runoff_cfs_wbm)
+  dplyr::mutate(Runoff = runoff_in_wbm)
 
 hist_median <- median(pdat[pdat$year < 2013, ]$Runoff, na.rm = TRUE) %>% as.numeric()
 hist_q_low  <- quantile(pdat[pdat$year < 2013, ]$Runoff, 0.1, na.rm = TRUE) %>% as.numeric()
@@ -3068,8 +3404,8 @@ runoff_var <- ggplot(
   geom_hline(aes(yintercept = hist_q_high,  color = "Historical 0.1 and 0.9 Quantile"),
              linetype = "dashed") +
   theme_bw() +
-  labs(x = "", y = "Annual Runoff (CF)") +
-  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+  labs(x = "", y = "Annual Runoff (in)") +
+  #scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
   scale_fill_manual("", values  = c("Historical" = nps_pal$grey,
                                     "Drier"      = nps_pal$red,
                                     "Wetter"     = nps_pal$blue)) +
@@ -3121,11 +3457,11 @@ t %>%
   )
 
 ggsave(runoff_var,
-       filename = "docs/Deep Dives/CEBR/Figs/Runoff_Var.tif",
+       filename = "data/park/CEBR/Figs/Runoff_Var.tif",
        dpi = 600, width = 7, height = 3)
 ```
 
-##### Extreme Precipitation Frequency (Figure B6)
+##### ---- Extreme Precipitation Frequency (Figure B6)
 
 Frequency of extreme (99th percentile) 3-day precipitation events.
 
@@ -3141,7 +3477,7 @@ df <- wbm %>%
   dplyr::filter(!is.na(rolling_3day))
 ```
 
-#### Seasonal Water Balance Figure
+##### ---- Seasonal Water Balance Figure
 
 ```{r seasonal_wbm}
 # --- 1. Assign Seasons and Summarize to Annual-Month ---
@@ -3224,7 +3560,7 @@ ggsave(seasonal_fig,
        dpi = 600, width = 7, height = 5)
 ```
 
-##### Snowmelt Fraction
+##### ---- Snowmelt Fraction
 
 Daily snowmelt fraction of total runoff, and mean day-of-year snowmelt and
 discharge timing across climate futures.
@@ -3338,7 +3674,7 @@ dis_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
   theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
 ```
 
-#### Weather Comparison Figures
+##### ---- Weather Comparison Figures
 
 Comparison of the Brian Head SNOTEL and Blowhard Mountain weather station
 records against the NPS WBM simulated snowpack.
@@ -3418,7 +3754,7 @@ ggsave(weather_comp_fig,
        width = 7, height = 3, dpi = 600)
 ```
 
-##### Historical Fires
+##### ---- Historical Fires
 
 ```{r figure_B7}
 # --- 1. Prepare Basemap Tile ---
@@ -3517,7 +3853,7 @@ ggplot() +
        title = "Distributions of Annual Runoff by Climate Future")
 ```
 
-##### Supply and Demand Maps
+##### ---- Supply and Demand Maps
 
 ```{r supply_demand_figs}
 # Figure 14a and 14b: spatial maps of supply and recharge area — see tmap code
