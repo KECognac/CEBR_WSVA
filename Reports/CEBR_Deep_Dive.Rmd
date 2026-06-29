@@ -1227,7 +1227,8 @@ low_y  <- "Dry"
 selected_gcms <- select_cfs_deep_dive(
   df        = future_differentials,
   x, y, x_name, y_name, high_x, low_x, high_y, low_y,
-  to_plot   = TRUE
+  to_plot   = TRUE,
+  highlight = c("Hot Dry", "Hot Wet")
 )
 
 # Relabel CF names to "Wetter" / "Drier" for clarity throughout report
@@ -2380,27 +2381,35 @@ Mean supply, demand, and D-S ratios for historical and projected periods
 DS_stats <- DS_df %>%
   dplyr::mutate(
     stat_period = ifelse(year >= 1980 & year < 2012,  "historical",
-                  ifelse(year >= 2010 & year < 2025,  "near-term",
-                  ifelse(year >= 2035 & year < 2065,  "future", NA)))
+                  ifelse(year >= 2035 & year < 2065,  "future", NA))
   ) %>%
   drop_na(stat_period) %>%
+  # discharge_cf is already an annual value in DS_df (one row per year),
+  # so no additional annual aggregation is needed before grouping
   dplyr::group_by(stat_period, CF) %>%
   dplyr::summarize(
-    mean_supply_cf = mean(discharge_cf),
-    min_supply_cf  = min(discharge_cf),
-    mean_demand    = mean(mid_use),
-    high_demand    = max(high_use),
-    DS             = mean(DS),
-    DS_stress      = mean(DS_stress),
-    .groups        = "keep"
-  ) %>%
-  # Convert to millions of gallons for reporting
+  `Mean Supply (1M gal)`    = mean(discharge_cf),
+  `Min Supply (1M gal)`     = min(discharge_cf),
+  `Mean Demand (1M gal)`    = mean(mid_use),
+  `High Demand (1M gal)`    = max(high_use),
+  `D:S`                     = mean(DS),
+  `D:S Stress`              = mean(DS_stress),
+  .groups = "keep"
+) %>%
   dplyr::mutate(across(
-    c("mean_supply_cf", "min_supply_cf", "mean_demand", "high_demand"),
-    .fns = ~ .x * cf_to_gal / 100000
-  ))
+    c("Mean Supply (1M gal)", "Min Supply (1M gal)",
+      "Mean Demand (1M gal)", "High Demand (1M gal)"),
+    .fns = ~ .x * cf_to_gal / 1000000
+  )) %>%
+  ungroup() %>%
+  select(-stat_period) %>%
+  dplyr::mutate(CF = factor(CF, levels = c("Historical", "Drier", "Wetter"))) %>%
+  dplyr::arrange(CF) %>%
+  dplyr::mutate(across(where(is.numeric), ~ round(.x, 2)))
 
 kable(DS_stats)
+
+
 ```
 
 ##### ---- Table 4: Storage-to-Demand Ratio
