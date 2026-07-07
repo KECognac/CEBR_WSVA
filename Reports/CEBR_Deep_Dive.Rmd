@@ -902,7 +902,8 @@ available.
 isotopes <- read_csv("data/park/ZION/isotope.csv") %>%
   dplyr::mutate(
     label = Location,
-    label = str_replace_all(label, fixed("(C-36- 9)35dca-S1"), "Arch Spring")
+    label = str_replace_all(label, fixed("(C-36- 9)35dca-S1"), "Arch Spring"),
+            str_replace_all(label, fixed("Alpine Pond Spring; CEBR_S0002"), "Alpine Pond Spring")
   )
 
 iso_p <- isotopes %>%
@@ -920,52 +921,138 @@ cc_slope <- cedar_city_lmwl$coefficients[[2]]
 cc_int   <- cedar_city_lmwl$coefficients[[1]]
 g_slope  <- 8.02
 g_int    <- 9.47
-lab_x    <- -7.5
+lab_x    <- -13
 
 # --- 3. Dual-Isotope Plot ---
+
+# Extract Blowhard Spring coordinates for callout
+blowhard_pt <- isotopes %>%
+  dplyr::filter(Park_Code == "CEBR", label == "Blowhard Spring")
+# Extract named site coordinates for callouts
+cebr_named <- isotopes %>%
+  dplyr::filter(
+    Park_Code == "CEBR",
+    label %in% c("Arch Spring", "Cedar Breaks VC tap water",
+                 "Shooting Star Spring", "Twin Springs",
+                 "Sunset Spring; CEBR_S0001",
+                 "Blowhard Spring", "Lundale Spring", 
+                     "Brian Head Lodge tap water", "Walts Spring",
+                 "Alpine Pond Spring")
+  ) %>%
+  # If any site has multiple samples, take the mean position for label placement
+  dplyr::group_by(label) %>%
+  dplyr::summarize(
+    delta_18O = mean(delta_18O, na.rm = TRUE),
+    delta_2H  = mean(delta_2H,  na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  # Define label offsets manually to avoid overlap — adjust as needed
+  dplyr::mutate(
+    label_x = delta_18O + c( -.4, -0.3,  0.3, -0.3,  0.4, -0.3,  0.3, -.2, 0.2, -.3),
+    label_y = delta_2H  + c(  11,    8,   -9,    8,   -13,    8,   -8, 6,-6, -8)
+  )
+
 ggplot(
     isotopes %>%
       dplyr::filter(
-        label       != "Cedar City(Utah)",
-        Sample_Type %in% "GWS"
+        Park_Code == "CEBR",
+        label     != "Cedar City(Utah)"
       ),
     aes(x = delta_18O, y = delta_2H)
   ) +
-  geom_abline(intercept = g_int,   slope = g_slope, color = "gray80") +
-  annotate("text", x = lab_x, y = g_slope * lab_x + g_int + 1.7,
-    label = "GMWL", color = "gray40", angle = 30, hjust = 0, vjust = 0,
+  geom_abline(intercept = g_int, slope = g_slope, color = "gray80") +
+  annotate("text", x = lab_x, y = g_slope * lab_x + g_int + 2,
+    label = "GMWL", color = "gray40", angle = 20, hjust = 0, vjust = 0,
     size = 4, fontface = "italic") +
-  geom_abline(intercept = cc_int, slope = cc_slope, color = "black") +
-  annotate("text", x = lab_x, y = cc_slope * lab_x + cc_int - 2.5,
-    label = "LMWL (Cedar City)", color = "black", angle = 30, hjust = 0,
-    vjust = 0, size = 4, fontface = "italic") +
-  geom_point(aes(shape = Park_Code), size = 3, alpha = 0.9) +
+
+  # All background points — black fill, white outline
+  geom_point(
+    data = isotopes %>%
+      dplyr::filter(
+        Park_Code == "CEBR",
+        label     != "Cedar City(Utah)"
+      ),
+    aes(shape = Sample_Type),
+    size   = 3,
+    alpha  = 1,
+    fill   = "black",
+    color  = "white",
+    stroke = 0.6
+  ) +
+  scale_shape_manual("Sample Type", values = c(
+    "GWS" = 21,
+    "GWW" = 22,
+    "P" = 23,
+    "SWR" = 24
+  )) +
+
+  # CEBR named sites — outer ring
   geom_point(
     data = isotopes %>%
       dplyr::filter(
         Park_Code == "CEBR",
         label %in% c("Arch Spring", "Cedar Breaks VC tap water",
-                     "Sunset Spring; CEBR_S0001")
+                     "Shooting Star Spring", "Twin Springs",
+                     "Sunset Spring; CEBR_S0001",
+                     "Blowhard Spring", "Lundale Spring", 
+                     "Brian Head Lodge tap water", "Walts Spring",
+                     "Alpine Pond Spring")
       ),
-    aes(color = label), shape = 1, size = 6
+    aes(color = label), shape = 1, size = 6, show.legend = FALSE
   ) +
+  # CEBR named sites — inner fill
   geom_point(
     data = isotopes %>%
       dplyr::filter(
         Park_Code == "CEBR",
         label %in% c("Arch Spring", "Cedar Breaks VC tap water",
-                     "Sunset Spring; CEBR_S0001")
+                     "Shooting Star Spring", "Twin Springs",
+                     "Sunset Spring; CEBR_S0001",
+                     "Blowhard Spring", "Lundale Spring",
+                     "Brian Head Lodge tap water", "Walts Spring",
+                     "Alpine Pond Spring")
       ),
-    aes(color = label), size = 2
+    aes(color = label), size = 2, show.legend = FALSE
   ) +
+
+  # Callout segments for all named sites
+  geom_segment(
+    data = cebr_named,
+    aes(x    = delta_18O, y    = delta_2H,
+        xend = label_x,   yend = label_y),
+    color     = "gray30",
+    linewidth = 0.4,
+    arrow     = arrow(length = unit(0.12, "cm"), type = "open", ends = "first")
+  ) +
+
+  # Callout labels for all named sites
+  geom_label(
+    data = cebr_named,
+    aes(x = label_x, y = label_y,
+        label = gsub("; CEBR_S0001", "", label)),  # clean up Sunset Spring label
+    hjust      = 0.5,
+    size       = 2.8,
+    color      = "gray20",
+    fill       = "white",
+    label.size = 0.25,
+    label.padding = unit(0.15, "lines")
+  ) +
+
   theme_bw() +
+  ylim(-120, -80) +
+  xlim(-15.5, -12.5) +
   labs(
-    color = "",
     shape = "Sample Type",
     x     = expression(delta^{18}*O ~ "(\u2030 vs. VSMOW)"),
     y     = expression(delta^{2}*H  ~ "(\u2030 vs. VSMOW)")
   ) +
-  theme(legend.position = "bottom")
+  theme(legend.position = "bottom") +
+  guides(
+    shape = guide_legend(nrow = 1, byrow = TRUE)
+  )
+
+ggsave("data/park/CEBR/Figs/Isotopes.jpg", width = 7, height = 5, dpi = 600)
+
 ```
 
 ### 5. Climate and Water Balance
@@ -1157,7 +1244,8 @@ two end members that produce the maximum and minimum projected runoff.
 ```{r gcm_differentials}
 # --- 1. Combine Historical and Future WBM Outputs ---
 wbm_all <- hist_wbm %>%
-  bind_rows(fut_wbm) %>%
+  bind_rows(fut_wbm %>%
+              dplyr::filter(year(date) > 2025)) %>%
   as.data.table() %>%
   left_join(all_cfs, by = "GCM") %>%
   dplyr::mutate(
@@ -1274,6 +1362,7 @@ wbm <- wbm_all %>%
   # Convert temperature and add runoff in volume units
   dplyr::mutate(
     tmean_F    = (9/5 * tmean_C) + 32,
+    # whenever runoff is reported as volume, scale factor is applied
     runoff_cf  = (runoff_in_wbm / 12) * recharge_area_ft2 * scale_factor,
     runoff_gal = runoff_cf * cf_to_gal,
     runoff_gpm = runoff_gal / (60 * 24)
@@ -1396,22 +1485,23 @@ wbm <- wbm %>%
 
 
 # --- 6. Annual and Monthly Aggregations ---
-mean_cols <- c("soil_in_wbm", "tmean_C", "runoff_cfs_wbm", "tmean_F",
+mean_cols <- c("soil_in_wbm", "tmean_C", "runoff_cfs_wbm", "tmean_F", "runoff_gpm",
                "discharge_gpm", "discharge_gpm_low", "discharge_gpm_high")
 
 wbm_annual <- wbm %>%
   dplyr::mutate(year = calc_water_year(date)) %>%
   dplyr::select(-c(Rank, Region, RCP, Skill, date)) %>%
-  dplyr::group_by(year, GCM, CF) %>%
+  dplyr::group_by(year, GCM, CF, name) %>%
   dplyr::summarize(
-    across(all_of(mean_cols), \(x) mean(x, na.rm = TRUE)),
-    across(everything(),      \(x) sum(x,  na.rm = TRUE))
+    across(all_of(mean_cols),                          \(x) mean(x, na.rm = TRUE)),
+    across(where(is.numeric) & !all_of(mean_cols),     \(x) sum(x,  na.rm = TRUE)),
+    .groups = "drop"
   )
 
 wbm_monthly <- wbm %>%
   dplyr::mutate(ym = make_ym(date)) %>%
   dplyr::select(-c(Rank, Region, RCP, Skill, date)) %>%
-  dplyr::group_by(ym, GCM, CF) %>%
+  dplyr::group_by(ym, GCM, CF, name) %>%
   dplyr::summarize(
     across(all_of(mean_cols), \(x) mean(x, na.rm = TRUE)),
     across(everything(),      \(x) sum(x,  na.rm = TRUE))
@@ -2336,7 +2426,7 @@ change <- wbm_annual %>%
   mutate(stat_group = ifelse(year < 2013, "Hist",
                       ifelse(year >= 2035, "Fut", "Present"))) %>%
   dplyr::ungroup() %>%
-  dplyr::select(stat_group, CF, runoff_in_wbm, discharge_gpm) %>%
+  dplyr::select(stat_group, CF, runoff_gpm, discharge_gpm) %>%
   dplyr::group_by(CF, stat_group) %>%
   dplyr::summarize_all(.funs = list(mean = mean, sd = sd)) %>%
   dplyr::filter(
@@ -3221,9 +3311,15 @@ ggsave(flow_dat_fig,
 Historical and projected annual water budget components for the recharge area,
 shown with a 10-year rolling average.
 
+Note, this figure is summarized by water year, so 2026 and 2100 end up with 
+partial years for summed variables and therefore appear significantly less.
+Because of that, 2026 and 2100 are removed from plotting. These years are not
+included in any statistics, so that should be good.
+
 ```{r wb_fig}
 # --- 1. Reshape Annual WBM Data for Faceted Plot ---
 plot_dat <- wbm_annual %>%
+  dplyr::filter(!year %in% c(2026, 2100)) %>%
   dplyr::ungroup() %>%
   dplyr::select(
     year, GCM, CF,
@@ -3233,7 +3329,7 @@ plot_dat <- wbm_annual %>%
     "Snowmelt (in)"      = "melt_in_wbm",
     "Rain (in)"          = "rain_in_wbm",
     "Snow (in)"          = "snow_in_wbm",
-    "Discharge (gpm)"    = "discharge_gpm",
+    "Spring Flow (gpm)"    = "discharge_gpm",
     "Runoff (in)"        = "runoff_in_wbm"
   ) %>%
   tidyr::pivot_longer(-c(year, GCM, CF), names_to = "vars", values_to = "vals") %>%
@@ -3262,7 +3358,7 @@ wb_fig <- ggplot(plot_dat) +
   facet_wrap(
     ~ factor(vars, levels = c("Temperature (F)", "Precipitation (in)", "Rain (in)",
                               "Snow (in)", "Snowmelt (in)", "AET (in)",
-                              "Runoff (in)", "Discharge (gpm)")),
+                              "Runoff (in)", "Spring Flow (gpm)")),
     scales = "free", nrow = 2
   ) +
   theme(legend.position = "bottom", legend.margin = margin(t = -20, b = 0, l = 0, r = 0))
@@ -3557,6 +3653,146 @@ df <- wbm %>%
   dplyr::filter(!is.na(rolling_3day))
 ```
 
+
+
+##### Extreme Event Figures
+
+The next two figures use the same analytical workflow applied to different variables. A shared helper function avoids code duplication.
+
+```{r extreme_event_helper}
+
+# NPS-specific branding palette
+nps_pal <- list(
+  blue      = "#85b6dc",
+  red       = "#c5312a",
+  grey      = "#a9a9a9",
+  lightgrey = "#dcdcdc"
+)
+
+# Named CF color vector — used throughout all figures
+plot_colors <- c(
+  "Historical" = "#a9a9a9",
+  "Drier"    = "#c5312a",
+  "Wetter"   = "#85b6dc"
+)
+
+# --- 5. Shared ggplot Helpers ---
+
+# Convenience wrappers: apply the standard CF color scheme with one call
+scale_fill_cf  <- function(...) scale_fill_manual("",  values = plot_colors, ...)
+scale_color_cf <- function(...) scale_color_manual("", values = plot_colors, ...)
+
+# Standard bottom-legend theme with a tight negative top margin
+theme_legend_bottom <- theme(
+  legend.position = "bottom",
+  legend.margin   = margin(t = -15, b = 0, l = 0, r = 0)
+)
+
+# Computes 3-day rolling event frequency and intensity, and produces a bar chart figure.
+# wbm_df  : the `wbm` daily data frame
+# var_col : column name for the variable of interest (e.g., "precip_in_wbm")
+# y_label : y-axis label for the plot
+# Returns a named list: fig, year_counts, quantiles, stats
+make_extreme_event_fig <- function(wbm_df, var_col, y_label) {
+  q_low  <- 0.05
+  q_high <- 0.99
+  df <- wbm_df %>%
+    dplyr::rename(cf = CF) %>%
+    dplyr::group_by(cf) %>%
+    dplyr::mutate(
+      rolling_3day = frollapply(.data[[var_col]], FUN = "sum", n = 3, align = "center"),
+      date         = as_date(date),
+      year         = year(date)
+    ) %>%
+    dplyr::filter(!is.na(rolling_3day))
+  # Historical quantile thresholds (baseline period only)
+  historic_q <- df %>%
+    dplyr::filter(cf == "Historical", rolling_3day > 0,
+                  year >= hist_yrs[1] & year < hist_yrs[2]) %>%
+    dplyr::ungroup() %>%
+    dplyr::summarize(
+      QLOW  = quantile(rolling_3day, probs = q_low),
+      QHIGH = quantile(rolling_3day, probs = q_high)
+    )
+  year_counts <- df %>%
+    dplyr::mutate(
+      low_day  = as.integer(rolling_3day <= historic_q$QLOW),
+      high_day = as.integer(rolling_3day >= historic_q$QHIGH),
+      year     = year(date)
+    ) %>%
+    dplyr::group_by(cf, year) %>%
+    dplyr::summarize(n_low_days  = sum(low_day),
+                      n_high_days = sum(high_day),
+                      max_3day    = max(rolling_3day, na.rm = TRUE),
+                      .groups = "drop") %>%
+    dplyr::mutate(
+      CF       = factor(cf, levels = c("Historical", "Drier", "Wetter")),
+      rect_min = ifelse(cf != "Historical", 2035, 1979),
+      rect_max = ifelse(cf != "Historical", 2065, 2012)
+    )
+  # Frequency + intensity stats over the relevant historical/future windows
+  stats <- year_counts %>%
+    dplyr::filter((year >= hist_yrs[1] & year < hist_yrs[2]) |
+                  (year >= fut_yrs[1]  & year < fut_yrs[2])) %>%
+    dplyr::group_by(cf) %>%
+    dplyr::summarize(
+      count           = sum(n_high_days, na.rm = TRUE),
+      mean            = mean(n_high_days, na.rm = TRUE),
+      max_intensity   = max(max_3day, na.rm = TRUE),
+      .groups = "drop"
+    )
+  # % change in max intensity relative to Historical
+  hist_max <- stats$max_intensity[stats$cf == "Historical"]
+  stats <- stats %>%
+    dplyr::mutate(pct_change_intensity = (max_intensity - hist_max) / hist_max * 100)
+  fig <- ggplot(year_counts) +
+    geom_rect(aes(xmin = rect_min, xmax = rect_max, ymin = -Inf, ymax = Inf),
+              fill = "grey85", linewidth = 0, alpha = 0.1) +
+    geom_bar(aes(x = year, y = n_high_days, fill = CF),
+             stat = "identity", width = 0.9,
+             position = position_dodge(width = 0.9), color = "black", linewidth = 0.3) +
+    theme_bw() +
+    labs(x = "", y = y_label) +
+    scale_fill_cf() +
+    facet_wrap(~CF, scales = "free_x", ncol = 3) +
+    theme(axis.text.x       = element_text(angle = 45, vjust = 1, hjust = 1),
+          strip.background   = element_rect(fill = "gray95"),
+          strip.text         = element_text(colour = "black", face = "bold")) +
+    theme_legend_bottom
+  list(fig = fig, year_counts = year_counts, quantiles = historic_q, stats = stats)
+}
+```
+
+```{r extreme_precip_frequency}
+precip_extreme <- make_extreme_event_fig(
+  wbm_df  = wbm,
+  var_col = "precip_in_wbm",
+  y_label = "Number Precipitation Events ≥ p99"
+)
+
+stats_precip <- precip_extreme$stats
+precip_extreme$fig
+
+ggsave(precip_extreme$fig, filename = "data/park/CEBR/Figs/Extreme_Precip_events.jpg",
+       dpi = 600, height = 3, width = 7.5)
+```
+
+
+```{r extreme_runoff_frequency}
+runoff_extreme <- make_extreme_event_fig(
+  wbm_df  = wbm,
+  var_col = "runoff_in_wbm",
+  y_label = "Number Runoff Events ≥ p99"
+)
+
+stats_runoff <- runoff_extreme$stats
+runoff_extreme$fig
+
+ggsave(runoff_extreme$fig, filename = "data/park/CEBR/Figs/Extreme_Runoff_events.jpg",
+       dpi = 600, height = 3, width = 7.5)
+```
+
+
 ##### ---- Seasonal Water Balance Figure
 
 ```{r seasonal_wbm}
@@ -3711,47 +3947,75 @@ view(snowmelt_stats)
 sm_fraction_fig <- ggplot(pdat) +
   geom_rect(aes(xmin = 2035, xmax = 2065, ymin = -Inf, ymax = Inf),
             fill = "lightgrey", alpha = 0.1) +
-  geom_line(aes(x = year, y = melt_frac), color = "black", lwd = 2, lineend = "round") +
-  geom_line(aes(x = year, y = melt_frac, color = CF), lwd = 1.5, lineend = "round") +
+  geom_line(aes(x = year, y = melt_frac, group = CF),
+            color = "black", lwd = 2, lineend = "round") +
+  geom_line(aes(x = year, y = melt_frac, color = CF),
+            lwd = 1.5, lineend = "round") +
+  scale_color_manual("",
+    values = c("Historical" = nps_pal$grey,
+               "Drier"      = nps_pal$red,
+               "Wetter"     = nps_pal$blue)) +
+  labs(x = "", y = "Snowmelt Fraction\nof Runoff") +
   theme_bw() +
-  labs(x = "", y = "Snowmelt Fraction of Runoff") +
-  scale_color_manual("", values = c("Historical" = nps_pal$grey,
-                                    "Drier"      = nps_pal$red,
-                                    "Wetter"     = nps_pal$blue)) +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+  theme(legend.position = "bottom",
+        legend.margin   = margin(t = -15, b = 0, l = 0, r = 0))
 
 # --- 4. Snowmelt Timing Figure ---
 sm_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
-  geom_point(aes(y = snowmelt), alpha = 0.3) +
-  geom_line(aes(y = snowmelt_mov, group = CF), linewidth = 2, color = "black", lineend = "round") +
-  geom_line(aes(y = snowmelt_mov), linewidth = 1.5, lineend = "round") +
+  #geom_point(aes(y = snowmelt), alpha = 0.3) +
+  geom_line(aes(y = snowmelt_mov, group = CF),
+            linewidth = 2, color = "black", lineend = "round") +
+  geom_line(aes(y = snowmelt_mov),
+            linewidth = 1.5, lineend = "round") +
   geom_vline(data = peak_melt,
              aes(color = CF, xintercept = doy_date, linetype = "Peak Melt"),
              lwd = 1.5, alpha = 0.5) +
-  theme_bw() +
-  scale_color_manual("DOY Mean &\n5-Day\nRolling Mean",
-    values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
+  scale_color_manual("DOY Mean &\n5-Day Rolling Mean",
+    values = c("Historical" = nps_pal$grey,
+               "Drier"      = nps_pal$red,
+               "Wetter"     = nps_pal$blue)) +
   scale_linetype_manual("", values = c(1)) +
   scale_x_date(date_breaks = "1 month", date_labels = "%b %d") +
-  labs(y = "Mean Daily Snowmelt (in)", x = "") +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
-
-sm_timing_fig
+  labs(x = "", y = "Mean Daily\nSnowmelt (in)") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.margin   = margin(t = -15, b = 0, l = 0, r = 0))
 
 # --- 5. Discharge Timing Figure ---
 dis_timing_fig <- ggplot(snowmelt_stats_d, aes(x = doy_date, color = CF)) +
   geom_point(aes(y = discharge), alpha = 0.3) +
-  geom_line(aes(y = discharge_mov, group = CF), linewidth = 2, color = "black", lineend = "round") +
-  geom_line(aes(y = discharge_mov), linewidth = 1.5, lineend = "round") +
+  geom_line(aes(y = discharge_mov, group = CF),
+            linewidth = 2, color = "black", lineend = "round") +
+  geom_line(aes(y = discharge_mov),
+            linewidth = 1.5, lineend = "round") +
   geom_vline(data = peak_discharge,
              aes(color = CF, xintercept = doy_date, linetype = "Peak Discharge"),
              lwd = 1.5, alpha = 0.5) +
-  theme_bw() +
+  scale_color_manual("DOY Mean &\n5-Day Rolling Mean",
+    values = c("Historical" = nps_pal$grey,
+               "Drier"      = nps_pal$red,
+               "Wetter"     = nps_pal$blue)) +
+  scale_linetype_manual("", values = c(1)) +
   scale_x_date(date_breaks = "1 month", date_labels = "%b %d") +
-  scale_color_manual("DOY Mean &\n5-Day\nRolling Mean",
-    values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
-  labs(y = "Mean Daily Discharge (gpm)", x = "") +
-  theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+  labs(x = "", y = "Mean Daily Blowhard\nSpring Flow (gpm)") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.margin   = margin(t = -15, b = 0, l = 0, r = 0))
+
+# --- 6. Combine and Save ---
+sm_fig_all <- ggarrange(
+  sm_fraction_fig,
+  sm_timing_fig,
+  dis_timing_fig,
+  ncol          = 1,
+  common.legend = TRUE,
+  legend        = "bottom"
+)
+
+sm_fig_all
+
+ggsave(plot = sm_fig_all, "data/park/CEBR/Figs/sm_fig.jpg", dpi = 600, width = 7, height = 7)
+
 ```
 
 ##### ---- Weather Comparison Figures
