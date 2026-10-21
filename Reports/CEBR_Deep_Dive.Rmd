@@ -1601,6 +1601,20 @@ wbm_monthly <- wbm %>%
     across(everything(),      \(x) sum(x,  na.rm = TRUE))
   )
 
+# Water years with incomplete daily records (the first and last water years of
+# the historical and future runs). These are dropped from annual figures only;
+# all statistics use full-year analysis windows that exclude them.
+partial_water_years <- wbm %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(year = calc_water_year(date)) %>%
+  dplyr::count(CF, year, name = "n_days") %>%
+  dplyr::filter(n_days < 365) %>%
+  dplyr::select(CF, year)
+
+drop_partial_wy <- function(df) {
+  dplyr::anti_join(df, partial_water_years, by = c("CF", "year"))
+}
+
 rm(wbm_all)
 gc()
 ```
@@ -3440,15 +3454,15 @@ ggsave(flow_dat_fig,
 Historical and projected annual water budget components for the recharge area,
 shown with a 10-year rolling average.
 
-Note, this figure is summarized by water year, so 2026 and 2100 end up with 
-partial years for summed variables and therefore appear significantly less.
-Because of that, 2026 and 2100 are removed from plotting. These years are not
-included in any statistics, so that should be good.
+Note, this figure is summarized by water year, so the first and last water years
+of the historical and future runs are partial years for summed variables and
+would appear significantly lower. These partial water years are removed from
+plotting with `drop_partial_wy()`; they are not included in any statistics.
 
 ```{r wb_fig}
 # --- 1. Reshape Annual WBM Data for Faceted Plot ---
 plot_dat <- wbm_annual %>%
-  dplyr::filter(!year %in% c(2026, 2100)) %>%
+  drop_partial_wy() %>%
   dplyr::ungroup() %>%
   dplyr::select(
     year, GCM, CF,
@@ -3681,6 +3695,7 @@ historical 10th and 90th percentile bounds.
 ```{r runoff_variability}
 # --- 1. Prepare Data and Historical Reference Lines ---
 pdat <- wbm_annual %>%
+  drop_partial_wy() %>%
   dplyr::filter(year < 2100) %>%
   dplyr::mutate(Runoff = runoff_in_wbm)
 
@@ -4075,6 +4090,7 @@ peak_discharge <- snowmelt_stats_d %>% slice_max(discharge_mov)
 
 # --- 2. Annual Snowmelt Fraction Through Time ---
 pdat <- wbm_annual %>%
+  drop_partial_wy() %>%
   ungroup() %>%
   dplyr::group_by(year) %>%
   dplyr::mutate(
@@ -4384,7 +4400,7 @@ monthly_ds_fig <-  ggplot(pdat2) +
     scale_fill_manual("", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
     facet_wrap(~CF, scales = "free_x")
   
-annual_ds_fig <- ggplot(DS_df %>% dplyr::mutate(CF = factor(CF,levels=c("Historical","Drier","Wetter"))), aes(x = year)) +
+annual_ds_fig <- ggplot(DS_df %>% drop_partial_wy() %>% dplyr::mutate(CF = factor(CF,levels=c("Historical","Drier","Wetter"))), aes(x = year)) +
   geom_ribbon(aes(ymax = DS_stress, ymin = DS, fill = CF), alpha = 0.4) +
   geom_line(aes(y = DS, group = CF), color = "black", linewidth = 2, lineend = "round") +
   geom_line(aes(y = DS, color = CF), linewidth = 1, lineend = "round") +
