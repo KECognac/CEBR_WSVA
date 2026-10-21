@@ -2270,7 +2270,7 @@ save_table(
 fpr <- ggplot(all_delta_fireprob, aes(x = mean_runoff_in, y = delta_fp)) +
   geom_point(aes(color = GCM)) +
   geom_point(
-    data = delta_fireprob %>% dplyr::filter(CF %in% c("Warm Wet", "Hot Dry")),
+    data = delta_fireprob %>% dplyr::filter(CF %in% c("Hot Wet", "Hot Dry")),
     aes(x = mean_runoff_in, y = delta_fp),
     shape = 1, size = 5
   ) +
