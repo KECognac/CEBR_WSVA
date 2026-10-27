@@ -2324,14 +2324,21 @@ mean_fire_potential <- terra::zonal(
 )
 ```
 
+Wildfire sensitivity is rated by the percentage of the contributing (recharge)
+area with "High" or "Very High" WHP, consistent with the other deep dive
+reports: ≤ 5% = Low, > 5% and ≤ 50% = Moderate, > 50% = High. Forest cover
+(NLCD) is reported alongside it as context.
+
 ```{r percent_whp}
 # --- 1. Categorical WHP —  Fraction "High" or Better in Water Supply Area ---
 whp_conus_cls <- terra::rast("data/all/usfs_fire/whp2023_GeoTIF/whp2023_cls_conus.tif")
 
 plot(whp_conus_cls)
 
+# Use the recharge area itself (not the 500 m buffered aoi used to pick the
+# pyrome), so the percentage matches the forest cover statistic
 whp_park_cls <- whp_conus_cls %>%
-  terra::crop(., sf::st_transform(aoi, 5070), mask = TRUE, touches = TRUE) %>%
+  terra::crop(., sf::st_transform(recharge_aoi, 5070), mask = TRUE, touches = TRUE) %>%
   terra::na.omit()
 
 reclass      <- cats(whp_park_cls)[[1]] %>%
@@ -2344,10 +2351,28 @@ high_medium_mask <- whp_park_cls %in% c(3, 4, 5)
 
 # Fraction of "High" pixels in the watershed (area-weighted)
 high_mask_numeric <- classify(high_mask, cbind(TRUE, 1), cbind(FALSE, 0)) %>%
-  terra::zonal(., terra::vect(sf::st_transform(aoi, 5070)),
+  terra::zonal(., terra::vect(sf::st_transform(recharge_aoi, 5070)),
                fun = "mean", weights = TRUE, na.rm = TRUE)
 
 plot(classify(high_mask, cbind(TRUE, 1), cbind(FALSE, 0)))
+
+# --- 2. Wildfire Sensitivity Rating ---
+pct_whp_high <- 100 * as.numeric(high_mask_numeric[[1]])
+
+whp_sensitivity <- dplyr::case_when(
+  pct_whp_high <= 5  ~ "Low",
+  pct_whp_high <= 50 ~ "Moderate",
+  TRUE               ~ "High"
+)
+
+save_table(
+  tibble::tibble(
+    pct_recharge_area_whp_high_very_high = round(pct_whp_high, 1),
+    pct_recharge_area_forested           = round(100 * as.numeric(recharge_aoi_fraction[[1]]), 1),
+    wildfire_sensitivity                 = whp_sensitivity
+  ),
+  "wildfire_sensitivity_stats"
+)
 ```
 
 ### 8. Drought (SPEI)
