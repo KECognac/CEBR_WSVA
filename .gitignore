@@ -55,3 +55,6 @@ data
 data/
 Reports/*.docx
 Reports/DRAFT_CEBR_WSVA_review.docx
+
+# store
+.DS_Store
