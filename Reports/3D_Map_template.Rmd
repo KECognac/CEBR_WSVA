@@ -1,0 +1,119 @@
+---
+title: "CEBR 3D Map (template)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Builds the CEBR Blowhard Spring 3D figure with `render_map_3d()`
+(`src/map_3d.R`). To make one for another park, copy this file and change
+the AOI, the layers, and the view.
+
+Rendering uses {rayshader}. On macOS, {rgl} and {rayrender} need XQuartz
+(<https://www.xquartz.org>) to load, even when no window is opened.
+
+```{r setup}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Render off-screen (set before rayshader loads)
+options(rgl.useNULL = TRUE)
+source("setup.R")
+library(rayshader)
+
+```
+
+# 1. AOI and layers
+
+Any sf objects in any CRS. Each layer gets a legend name, a style, and
+optionally a callout box (position as a fraction of the image from the top
+left).
+
+```{r layers}
+
+park_dir <- "data/park/CEBR/report_data"
+
+park_boundary <- readRDS(file.path(park_dir, "park_boundary.rds"))
+
+recharge_area <- readRDS("data/park/CEBR/Climate_Data/recharge_area.rds")
+
+blowhard_intake <- read_excel("data/Water_Supply_Systems/NPS_Water_Systems_Database_Joined.xlsx",
+                              sheet = 1, na = c("NA", "U"), skip = 1) %>%
+  dplyr::filter(park_unit == "CEBR", !source_type %in% c("hauled", "Hauled")) %>%
+  drop_na(source_longitude, source_latitude) %>%
+  st_as_sf(coords = c("source_longitude", "source_latitude"), crs = 4326)
+
+streams <- readRDS(file.path(park_dir, "park_flowlines.rds"))
+springs <- readRDS(file.path(park_dir, "springs_joined.rds"))
+faults <- st_read("data/park/CEBR/cebr_geology_gdb/cebr_geology.gdb", layer = "cebrflt", quiet = TRUE)
+
+visitor_center <- readRDS(file.path(park_dir, "buildings.rds")) %>%
+  dplyr::filter(BLDGNAME == "Visitor Center")
+
+# OpenStreetMap main roads (cached by 3D_Map.Rmd)
+roads <- readRDS(file.path(park_dir, "osm_roads.rds")) %>%
+  dplyr::filter(highway %in% c("primary", "secondary"))
+
+test_well <- st_as_sf(data.frame(lon = -112.846386, lat = 37.607578),
+                      coords = c("lon", "lat"), crs = 4326)
+weather_station <- readRDS(file.path(park_dir, "blowhard_station.rds"))
+
+# Drawn in this order (later layers on top)
+layers <- list(
+  map3d_layer(park_boundary, "Cedar Breaks Boundary", "line", color = "#1b7a4a", width = 6,
+              callout = map3d_callout("Cedar Breaks", 0.25, 0.20)),
+  map3d_layer(streams, "Streams", "line", color = "#9fd3ff", width = 2, legend = FALSE),
+  map3d_layer(roads, "Roads", "line", color = "gray72", width = 2.5),
+  map3d_layer(recharge_area, "Blowhard Recharge Area", "fill", color = "hotpink", width = 2),
+  map3d_layer(faults, "Faults", "line", color = "#252525", width = 4),
+  map3d_layer(springs, "Springs", "point", color = "hotpink", size_m = 75),
+  map3d_layer(blowhard_intake, "Blowhard Intake", "point", color = "hotpink", size_m = 75,
+              legend = FALSE, callout = map3d_callout("Blowhard Intake", 0.80, 0.20)),
+  map3d_layer(visitor_center, "Visitor Center", "point", color = "#ffd400", size_m = 200,
+              outline = "gray15", callout = map3d_callout("Visitor Center", 0.55, 0.10)),
+  map3d_layer(test_well, "Test Well", "point", color = "#1f78b4", size_m = 150,
+              callout = map3d_callout("Test Well", 0.70, 0.08)),
+  map3d_layer(weather_station, "Weather Station", "square", color = "#252525", size_m = 150,
+              callout = map3d_callout("Blowhard Mtn. Radar\nWeather Station", 0.88, 0.29))
+)
+
+```
+
+# 2. Views
+
+`from` is the side the camera sits on ("NW" = looking southeast), or set
+`theta` directly. Overlay positions can be overridden per view.
+
+```{r views}
+
+views <- list(
+  basin = map3d_view(theta = -145, phi = 50, zoom = 0.85, fov = 20,
+                     north_arrow = c(0.10, 0.70),
+                     scalebar = list(km = 5, edge = "N", start = 0.10, inset = 0.01,
+                                     shift = c(-0.10, 0.05)))
+  # mountain = map3d_view(from = "S", phi = 25, zoom = 0.65, fov = 40)
+)
+
+```
+
+# 3. Render
+
+`preview = TRUE` shows a quick render in the plot pane and saves nothing.
+For the report figure, set `preview = FALSE` and give `out_dir`.
+
+```{r render}
+
+render_map_3d(
+  aoi = park_boundary, layers = layers, views = views,
+  dem = "data/park/CEBR/report_data/park_dem.tif", buffer_m = 5000, dem_agg = 6,
+  z_exag = 2, drape = "hillshade",
+  legend_order = c("Blowhard Recharge Area", "Cedar Breaks Boundary", "Faults", "Springs",
+                   "Visitor Center", "Test Well", "Weather Station", "Roads"),
+  notes = paste("Elevation: USGS 3D Elevation Program (via elevatr).",
+                "Roads: OpenStreetMap contributors. Shaded relief from the elevation model."),
+  preview = TRUE
+  # preview = FALSE, out_dir = "data/park/CEBR/Figs", prefix = "catchment_3d_template"
+)
+
+```
