@@ -526,6 +526,8 @@ print(summary(blowhard_mtn_d))
 blowhard_station <- stations %>%
   dplyr::filter(name == "BLOWHARD MTN RADAR")
 
+saveRDS(blowhard_station, "data/park/CEBR/report_data/blowhard_station.rds")
+
 # Nearby comparison stations
 select_station_list <- c("BLOWHARD MTN RADAR", "CEDAR BREAKS NM",
                          "CEDAR BREAKS STORAGE", "LOWDER RANGER STATION")
@@ -3804,7 +3806,6 @@ df <- wbm %>%
   ) %>%
   dplyr::filter(!is.na(rolling_3day))
 ```
-
 
 
 ##### Extreme Event Figures
