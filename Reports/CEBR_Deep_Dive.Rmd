@@ -248,6 +248,8 @@ springs_joined <- springs %>%
   dplyr::mutate(new_name = coalesce(short_name, spring_name)) %>%
   distinct(new_name, .keep_all = TRUE)
 
+#saveRDS(springs_joined, "data/park/CEBR/report_data/springs_joined.rds")
+
 # ---5. Test well coordinates - from Utah state well log map viewer
 # https://www.waterrights.utah.gov/wellinfo/welldrilling/wlbrowse.asp?WIN=25797
 test_well <- data.frame(
@@ -523,6 +525,8 @@ print(summary(blowhard_mtn_d))
 
 blowhard_station <- stations %>%
   dplyr::filter(name == "BLOWHARD MTN RADAR")
+
+saveRDS(blowhard_station, "data/park/CEBR/report_data/blowhard_station.rds")
 
 # Nearby comparison stations
 select_station_list <- c("BLOWHARD MTN RADAR", "CEDAR BREAKS NM",
@@ -926,8 +930,8 @@ thresh_poly   <- as.polygons(thresh_bin, dissolve = TRUE, na.rm = TRUE) %>%
 
 recharge_area <- thresh_poly[9, ]
 
-# saveRDS(recharge_area, "data/park/CEBR/Climate_Data/recharge_area.rds")
-# recharge_area <- readRDS("data/park/CEBR/Climate_data/recharge_area.rds")
+#saveRDS(recharge_area, "data/park/CEBR/Climate_Data/recharge_area.rds")
+#recharge_area <- readRDS("data/park/CEBR/Climate_data/recharge_area.rds")
 
 # --- 4. Visualization ---
 mapview::mapviewOptions(basemaps = c("Esri.WorldTopoMap"))
@@ -2320,14 +2324,21 @@ mean_fire_potential <- terra::zonal(
 )
 ```
 
+Wildfire sensitivity is rated by the percentage of the contributing (recharge)
+area with "High" or "Very High" WHP, consistent with the other deep dive
+reports: ≤ 5% = Low, > 5% and ≤ 50% = Moderate, > 50% = High. Forest cover
+(NLCD) is reported alongside it as context.
+
 ```{r percent_whp}
 # --- 1. Categorical WHP —  Fraction "High" or Better in Water Supply Area ---
 whp_conus_cls <- terra::rast("data/all/usfs_fire/whp2023_GeoTIF/whp2023_cls_conus.tif")
 
 plot(whp_conus_cls)
 
+# Use the recharge area itself (not the 500 m buffered aoi used to pick the
+# pyrome), so the percentage matches the forest cover statistic
 whp_park_cls <- whp_conus_cls %>%
-  terra::crop(., sf::st_transform(aoi, 5070), mask = TRUE, touches = TRUE) %>%
+  terra::crop(., sf::st_transform(recharge_aoi, 5070), mask = TRUE, touches = TRUE) %>%
   terra::na.omit()
 
 reclass      <- cats(whp_park_cls)[[1]] %>%
@@ -2340,10 +2351,28 @@ high_medium_mask <- whp_park_cls %in% c(3, 4, 5)
 
 # Fraction of "High" pixels in the watershed (area-weighted)
 high_mask_numeric <- classify(high_mask, cbind(TRUE, 1), cbind(FALSE, 0)) %>%
-  terra::zonal(., terra::vect(sf::st_transform(aoi, 5070)),
+  terra::zonal(., terra::vect(sf::st_transform(recharge_aoi, 5070)),
                fun = "mean", weights = TRUE, na.rm = TRUE)
 
 plot(classify(high_mask, cbind(TRUE, 1), cbind(FALSE, 0)))
+
+# --- 2. Wildfire Sensitivity Rating ---
+pct_whp_high <- 100 * as.numeric(high_mask_numeric[[1]])
+
+whp_sensitivity <- dplyr::case_when(
+  pct_whp_high <= 5  ~ "Low",
+  pct_whp_high <= 50 ~ "Moderate",
+  TRUE               ~ "High"
+)
+
+save_table(
+  tibble::tibble(
+    pct_recharge_area_whp_high_very_high = round(pct_whp_high, 1),
+    pct_recharge_area_forested           = round(100 * as.numeric(recharge_aoi_fraction[[1]]), 1),
+    wildfire_sensitivity                 = whp_sensitivity
+  ),
+  "wildfire_sensitivity_stats"
+)
 ```
 
 ### 8. Drought (SPEI)
@@ -2376,8 +2405,9 @@ agg_wbm <- wbm %>%
   dplyr::arrange(CF, ym)
 
 # --- 2. Calculate SPEI for Each Climate Future ---
-# Each future is appended to the historical record so SPEI is referenced to the
-# same historical normalization period (1980-2023) in each case.
+# Each future is appended to the historical record so SPEI is standardized to
+# the same 1980-2012 baseline used for every other historical-vs-future
+# comparison in the report.
 calc_spei_cf <- function(cf) {
   d <- agg_wbm %>%
     dplyr::filter(CF %in% c("Historical", cf)) %>%
@@ -2388,7 +2418,7 @@ calc_spei_cf <- function(cf) {
         ts(balance, start = c(year(min(ym)), month(min(ym))), frequency = freq),
         scale     = ag_n,
         ref.start = c(hist_yrs[1], 1),
-        ref.end   = c(2023, 12)
+        ref.end   = c(hist_yrs[2], 12)
       )[["fitted"]])
     )
 }
@@ -2400,7 +2430,11 @@ spei_wetter <- calc_spei_cf("Wetter")
 spei <- bind_rows(
   spei_drier  %>% dplyr::filter(CF == "Drier"),
   spei_wetter
-)
+) %>%
+  # Months beyond the support of the log-logistic fit to the 1980-2012 baseline
+  # return +/-Inf; cap SPEI at +/-3 (beyond the extreme-drought threshold, so
+  # drought category counts are unaffected)
+  dplyr::mutate(spei = pmin(pmax(spei, -3), 3))
 
 # Statistics use the baseline window for Historical and the future window for each CF
 spei_in_window <- function(df) {
@@ -3731,7 +3765,7 @@ runoff_var <- ggplot(
                                     "Drier"      = nps_pal$red,
                                     "Wetter"     = nps_pal$blue)) +
   scale_color_manual("", values = c("gray30", pal$black, "gray30")) +
-  facet_wrap(~CF, scales = "free_x", ncol = 3) +
+  facet_grid(~CF, scales = "free_x", space = "free_x") +
   theme(
     legend.position  = "bottom",
     legend.margin    = margin(t = -15, b = 0, l = 0, r = 0),
@@ -3797,7 +3831,6 @@ df <- wbm %>%
   ) %>%
   dplyr::filter(!is.na(rolling_3day))
 ```
-
 
 
 ##### Extreme Event Figures
@@ -3881,14 +3914,17 @@ make_extreme_event_fig <- function(wbm_df, var_col, y_label) {
     dplyr::group_by(cf) %>%
     dplyr::summarize(
       count           = sum(n_high_days, na.rm = TRUE),
-      mean            = mean(n_high_days, na.rm = TRUE),
+      mean            = mean(n_high_days, na.rm = TRUE),  # events per year
       max_intensity   = max(max_3day, na.rm = TRUE),
       .groups = "drop"
     )
   # % change in max intensity relative to Historical
   hist_max <- stats$max_intensity[stats$cf == "Historical"]
   stats <- stats %>%
-    dplyr::mutate(pct_change_intensity = (max_intensity - hist_max) / hist_max * 100)
+    dplyr::mutate(pct_change_intensity = (max_intensity - hist_max) / hist_max * 100,
+                  # frequency change as events per year, since the historical
+                  # (33-yr) and future (30-yr) windows differ in length
+                  freq_ratio = mean / mean[cf == "Historical"])
   fig <- ggplot(year_counts) +
     geom_rect(aes(xmin = rect_min, xmax = rect_max, ymin = -Inf, ymax = Inf),
               fill = "grey85", linewidth = 0, alpha = 0.1) +
@@ -3898,7 +3934,7 @@ make_extreme_event_fig <- function(wbm_df, var_col, y_label) {
     theme_bw() +
     labs(x = "", y = y_label) +
     scale_fill_cf() +
-    facet_wrap(~CF, scales = "free_x", ncol = 3) +
+    facet_grid(~CF, scales = "free_x", space = "free_x") +
     theme(axis.text.x       = element_text(angle = 45, vjust = 1, hjust = 1),
           strip.background   = element_rect(fill = "gray95"),
           strip.text         = element_text(colour = "black", face = "bold")) +
@@ -4411,7 +4447,7 @@ annual_ds_fig <- ggplot(DS_df %>% drop_partial_wy() %>% dplyr::mutate(CF = facto
   scale_color_manual("", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
   scale_fill_manual("", values = c("Historical" = nps_pal$grey, "Drier" = nps_pal$red, "Wetter" = nps_pal$blue)) +
   labs(x = "", y = "Annual D:S") +
-  facet_wrap(~CF, scales = "free_x")
+  facet_grid(~CF, scales = "free_x", space = "free_x")
 
 
 ds_fig <- ggarrange(monthly_ds_fig, annual_ds_fig, ncol = 1, common.legend = TRUE, legend = "right")

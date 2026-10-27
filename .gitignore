@@ -53,5 +53,8 @@ rsconnect/
 # User data
 data
 data/
-Reports/DRAFT_CEBR_WSVA.docx
+Reports/*.docx
 Reports/DRAFT_CEBR_WSVA_review.docx
+
+# store
+.DS_Store
